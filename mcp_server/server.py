@@ -6,16 +6,32 @@ runs, emit events, and post cross-agent intent signals. motto-director
 also reads fleet status here to drive its perceive→ideate→act loop.
 
 Run: `motto-mcp-server` (HTTP on $PORT). Schema is auto-applied on start.
+
+HTTP surface:
+    /mcp/                       FastMCP streamable-http transport (auth required)
+    /dashboard                  Read-only HTML fleet dashboard (auth required)
+    /fleet/status.json          Same data as /dashboard but JSON (auth required)
+    /healthz                    Liveness probe (open)
+
+Auth: every non-/healthz endpoint requires either
+  Authorization: Bearer <MOTTO_MCP_AUTH_TOKEN>   (preferred for MCP clients)
+  ?token=<MOTTO_MCP_AUTH_TOKEN>                  (works for browser dashboard)
+If MOTTO_MCP_AUTH_TOKEN is unset, all paths are open (dev/local mode).
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from html import escape as h
 from typing import Any
 
 from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from .db import Database
 
@@ -45,6 +61,9 @@ mcp = FastMCP(
     ),
     lifespan=_lifespan,
 )
+
+
+# ── MCP tools ─────────────────────────────────────────────────────────────────────────────────
 
 
 @mcp.tool
@@ -164,6 +183,185 @@ async def get_recent_events(
         kind=kind,
         limit=limit,
     )
+
+
+# ── HTTP custom routes (dashboard + status JSON + healthz) ─────────────────────────────────────
+
+
+def _auth_ok(request: Request) -> bool:
+    """Accept Bearer header or ?token= query, must equal MOTTO_MCP_AUTH_TOKEN.
+
+    When the env var is unset, all requests pass (dev/local mode).
+    """
+    expected = os.environ.get("MOTTO_MCP_AUTH_TOKEN")
+    if not expected:
+        return True
+    auth_header = request.headers.get("authorization", "")
+    if auth_header == f"Bearer {expected}":
+        return True
+    if request.query_params.get("token") == expected:
+        return True
+    return False
+
+
+@mcp.custom_route("/healthz", methods=["GET"])
+async def healthz(_request: Request):
+    return PlainTextResponse("ok")
+
+
+@mcp.custom_route("/fleet/status.json", methods=["GET"])
+async def fleet_status_json(request: Request):
+    if not _auth_ok(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    agents = await db.fleet_status()
+    events = await db.recent_events(
+        since_minutes=60, agent_name=None, kind=None, limit=200
+    )
+    return JSONResponse({
+        "now": datetime.now(timezone.utc).isoformat(),
+        "agents": agents,
+        "recent_events": events,
+    })
+
+
+@mcp.custom_route("/dashboard", methods=["GET"])
+async def dashboard(request: Request):
+    if not _auth_ok(request):
+        return HTMLResponse(
+            "<h1>unauthorized</h1>"
+            "<p>pass <code>?token=&lt;MOTTO_MCP_AUTH_TOKEN&gt;</code> "
+            "or send <code>Authorization: Bearer &lt;token&gt;</code>.</p>",
+            status_code=401,
+        )
+    agents = await db.fleet_status()
+    events = await db.recent_events(
+        since_minutes=60, agent_name=None, kind=None, limit=100
+    )
+    return HTMLResponse(_render_dashboard(agents, events))
+
+
+def _fmt_age(ts: str | None) -> str:
+    """Render an ISO-8601 timestamp as a relative age (e.g. '12s ago', '3h ago')."""
+    if not ts:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        delta = (datetime.now(timezone.utc) - dt).total_seconds()
+        if delta < 0:
+            return "now"
+        if delta < 60:
+            return f"{int(delta)}s ago"
+        if delta < 3600:
+            return f"{int(delta / 60)}m ago"
+        if delta < 86400:
+            return f"{int(delta / 3600)}h ago"
+        return f"{int(delta / 86400)}d ago"
+    except Exception:
+        return ts
+
+
+def _render_dashboard(agents: list[dict[str, Any]], events: list[dict[str, Any]]) -> str:
+    """Render a single-file dashboard. No JS. Refreshes via meta tag every 30s.
+
+    All user-supplied strings are HTML-escaped to prevent injection — agent
+    names and event payloads come from caller-controlled MCP tool input, so
+    don't trust them.
+    """
+    def _kind(k: str) -> str:
+        color = "#0a7" if k == "variable" else "#666"
+        weight = "600" if k == "variable" else "400"
+        return f'<span style="color:{color};font-weight:{weight}">{h(k)}</span>'
+
+    def _status(s: str) -> str:
+        colors = {
+            "success": "#0a7",
+            "error": "#c33",
+            "running": "#06b",
+            "cancelled": "#666",
+        }
+        return f'<span style="color:{colors.get(s, "#666")};font-weight:600">{h(s)}</span>'
+
+    def _level(lv: str) -> str:
+        colors = {"debug": "#999", "info": "#222", "warn": "#a60", "error": "#c33"}
+        return f'<span style="color:{colors.get(lv, "#222")}">{h(lv)}</span>'
+
+    def _payload_summary(p: dict[str, Any]) -> str:
+        try:
+            s = json.dumps(p, default=str)
+        except Exception:
+            s = repr(p)
+        if len(s) > 160:
+            s = s[:157] + "…"
+        return f"<code>{h(s)}</code>"
+
+    if agents:
+        agent_rows = "\n".join(
+            (
+                "<tr>"
+                f"<td><b>{h(a['name'])}</b></td>"
+                f"<td>{_kind(a['kind'])}</td>"
+                f"<td>{h(a.get('deploy_target') or '—')}</td>"
+                f"<td>{h(a.get('version') or '—')}</td>"
+                f"<td title=\"{h(a.get('last_seen_at') or '')}\">{h(_fmt_age(a.get('last_seen_at')))}</td>"
+                f"<td>{h(((a.get('last_run') or {}) or {}).get('kind') or '—')}</td>"
+                f"<td>{_status(((a.get('last_run') or {}) or {}).get('status') or '—')}</td>"
+                f"<td>{a.get('open_intents', 0)}</td>"
+                "</tr>"
+            )
+            for a in agents
+        )
+    else:
+        agent_rows = '<tr><td colspan="8"><i>no agents registered yet</i></td></tr>'
+
+    if events:
+        event_rows = "\n".join(
+            (
+                "<tr>"
+                f"<td title=\"{h(e.get('ts') or '')}\">{h(_fmt_age(e.get('ts')))}</td>"
+                f"<td>{h(e.get('agent_name') or '—')}</td>"
+                f"<td><code>{h(e.get('kind') or '—')}</code></td>"
+                f"<td>{_level(e.get('level') or 'info')}</td>"
+                f"<td>{_payload_summary(e.get('payload') or {})}</td>"
+                "</tr>"
+            )
+            for e in events
+        )
+    else:
+        event_rows = '<tr><td colspan="5"><i>no events in last 60 min</i></td></tr>'
+
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    return f"""<!DOCTYPE html>
+<html><head>
+  <title>motto fleet</title>
+  <meta charset="utf-8">
+  <meta http-equiv="refresh" content="30">
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 1100px; margin: 24px auto; padding: 0 16px; color: #222; }}
+    h1 {{ font-weight: 600; margin: 0; }}
+    h2 {{ font-weight: 600; margin-top: 1.8em; margin-bottom: 0.4em; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+    th {{ text-align: left; padding: 6px 8px; border-bottom: 2px solid #ddd; font-weight: 600; }}
+    td {{ padding: 5px 8px; border-bottom: 1px solid #eee; vertical-align: top; }}
+    code {{ font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; }}
+    .meta {{ color: #888; font-size: 12px; margin-top: 0.3em; }}
+  </style>
+</head><body>
+  <h1>motto fleet</h1>
+  <p class="meta">refreshes every 30s · {len(agents)} agents · {len(events)} recent events · {h(now)}</p>
+
+  <h2>agents</h2>
+  <table>
+    <tr><th>name</th><th>kind</th><th>deploy</th><th>version</th><th>last seen</th><th>last run</th><th>status</th><th>open intents</th></tr>
+    {agent_rows}
+  </table>
+
+  <h2>recent events (last 60 min)</h2>
+  <table>
+    <tr><th>when</th><th>agent</th><th>kind</th><th>level</th><th>payload</th></tr>
+    {event_rows}
+  </table>
+</body></html>"""
 
 
 def main() -> None:

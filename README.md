@@ -1,6 +1,7 @@
 # motto-mcp-server
 
-FastMCP fleet-coordination server, backed by Neon Postgres.
+FastMCP fleet-coordination server, backed by Neon Postgres. Also exposes a
+minimal HTML dashboard so a browser tab can serve as a poor-man's Horizon.
 
 Variable agents in the motto fleet (`motto-director`, `motto-sdr-agent`,
 `motto-social-agent`) call this MCP to:
@@ -16,6 +17,22 @@ Variable agents in the motto fleet (`motto-director`, `motto-sdr-agent`,
 
 Deterministic services (`motto-appraisal-pipeline`, `motto-video-agent`)
 do **not** call this MCP. They emit OpenTelemetry traces to Langfuse only.
+
+## HTTP surface
+
+| Path | Purpose | Auth |
+|------|---------|------|
+| `/mcp/` | FastMCP streamable-http transport (JSON-RPC) | required |
+| `/dashboard` | Read-only HTML fleet view, refreshes every 30s | required |
+| `/fleet/status.json` | Same data as dashboard, JSON | required |
+| `/healthz` | Liveness probe | open |
+
+Auth gate accepts EITHER:
+- `Authorization: Bearer <MOTTO_MCP_AUTH_TOKEN>` (preferred, used by MCP clients)
+- `?token=<MOTTO_MCP_AUTH_TOKEN>` (works for browser dashboard — just bookmark
+  `https://motto-mcp.northflank.app/dashboard?token=<token>`)
+
+If `MOTTO_MCP_AUTH_TOKEN` is unset, all paths are open (dev/local mode).
 
 ## Schema
 
@@ -38,30 +55,12 @@ Northflank, similar shape to the rest of the fleet:
    and put the connection string into the shared `motto-fleet-secrets`
    Doppler/Northflank secret group as `DATABASE_URL`.
 2. Generate `MOTTO_MCP_AUTH_TOKEN` (`openssl rand -hex 32`) and add to
-   the same group.
+   the same group. **Same value** for this server (it validates) AND for
+   each variable agent's group (they send it as bearer).
 3. Deploy this repo as a Docker service. Schema is applied automatically
    on first boot.
-
-## Auth (v0)
-
-This service has **no application-level auth in v0**. Deploy it inside
-the Northflank private group so only fleet agents can reach it.
-
-For public exposure later, add Starlette `BearerAuthMiddleware`
-around `mcp.http_app()` checking `MOTTO_MCP_AUTH_TOKEN`. Sketch:
-
-```python
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
-
-class BearerAuth(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        if request.url.path.startswith("/healthz"):
-            return await call_next(request)
-        if request.headers.get("authorization") != f"Bearer {EXPECTED}":
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-        return await call_next(request)
-```
+4. Open `https://<your-mcp-host>/dashboard?token=<token>` in a browser
+   and bookmark it. That's your Horizon.
 
 ## Local dev
 
@@ -70,6 +69,8 @@ cp .env.example .env  # fill DATABASE_URL
 pip install -e '.[dev]'
 motto-mcp-server  # starts on :8080
 ```
+
+Then `open http://localhost:8080/dashboard` (no token needed in dev mode).
 
 ## Tools (v0)
 
