@@ -19,9 +19,15 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev,doppler]"
       - name: Smoke import
         run: python -c "import mcp_server; from mcp_server import server, db; print('ok')"
+      - name: Smoke import (servers/doppler)
+        run: python -c "from servers.doppler import build_server; print('ok')"
+      - name: Lint (servers/)
+        run: ruff check servers
+      - name: Pytest
+        run: pytest servers -q
 
       # Posts the last 250 log lines of any failed step in this run as a sticky
       # PR comment so Claude sessions (which can't reach Actions logs from inside
