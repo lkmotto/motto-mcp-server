@@ -185,6 +185,67 @@ async def get_recent_events(
     )
 
 
+# ── Read / debug / replay tools ────────────────────────────────────────────────────────────────
+
+
+@mcp.tool
+async def list_runs(
+    agent_name: str | None = None,
+    status: str | None = None,
+    since_minutes: int = 60 * 24,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """List recent runs, newest first. Filter by agent_name and/or status."""
+    return await db.list_runs(
+        agent_name=agent_name,
+        status=status,
+        since_minutes=since_minutes,
+        limit=limit,
+    )
+
+
+@mcp.tool
+async def get_run(run_id: str) -> dict[str, Any]:
+    """Full run record + linked events + decisions + artifacts. For deep debugging."""
+    return await db.get_run(run_id=run_id)
+
+
+@mcp.tool
+async def get_decisions(
+    run_id: str | None = None,
+    agent_name: str | None = None,
+    choice: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Audit trail of material choices. Filter by run_id, agent, or choice kind."""
+    return await db.get_decisions(
+        run_id=run_id,
+        agent_name=agent_name,
+        choice=choice,
+        limit=limit,
+    )
+
+
+@mcp.tool
+async def get_locks() -> list[dict[str, Any]]:
+    """Currently held locks (resource, holder run, expires_at). Excludes expired."""
+    return await db.get_locks()
+
+
+@mcp.tool
+async def force_release_lock(resource: str) -> dict[str, bool]:
+    """Admin: release a stuck lock. Caller is responsible — no run_id check."""
+    released = await db.force_release_lock(resource=resource)
+    return {"released": released}
+
+
+@mcp.tool
+async def replay_run(run_id: str) -> dict[str, Any]:
+    """Replay bundle for a run: full record + events + decisions + artifacts,
+    plus parent_run and child_runs. Doesn't actually re-execute — caller's job."""
+    return await db.replay_run(run_id=run_id)
+
+
 # ── HTTP custom routes (dashboard + status JSON + healthz) ─────────────────────────────────────
 
 

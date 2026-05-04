@@ -30,6 +30,59 @@ async def _init_conn(conn: asyncpg.Connection) -> None:
     )
 
 
+def _run_row_to_dict(r: asyncpg.Record | None) -> dict[str, Any] | None:
+    if r is None:
+        return None
+    return {
+        "id": str(r["id"]),
+        "agent_name": r["agent_name"],
+        "kind": r["kind"],
+        "intent": r["intent"],
+        "status": r["status"],
+        "langfuse_trace_id": r["langfuse_trace_id"],
+        "started_at": r["started_at"].isoformat() if r["started_at"] else None,
+        "finished_at": r["finished_at"].isoformat() if r["finished_at"] else None,
+        "summary": r["summary"],
+        "parent_run_id": str(r["parent_run_id"]) if r["parent_run_id"] else None,
+    }
+
+
+def _event_row_to_dict(r: asyncpg.Record) -> dict[str, Any]:
+    return {
+        "id": r["id"],
+        "ts": r["ts"].isoformat(),
+        "level": r["level"],
+        "kind": r["kind"],
+        "payload": r["payload"],
+        "agent_name": r["agent_name"],
+        "run_id": str(r["run_id"]) if r["run_id"] else None,
+    }
+
+
+def _decision_row_to_dict(r: asyncpg.Record) -> dict[str, Any]:
+    return {
+        "id": r["id"],
+        "ts": r["ts"].isoformat(),
+        "choice": r["choice"],
+        "rationale": r["rationale"],
+        "payload": r["payload"],
+        "agent_name": r["agent_name"],
+        "run_id": str(r["run_id"]) if r["run_id"] else None,
+    }
+
+
+def _artifact_row_to_dict(r: asyncpg.Record) -> dict[str, Any]:
+    return {
+        "id": r["id"],
+        "ts": r["ts"].isoformat(),
+        "kind": r["kind"],
+        "name": r["name"],
+        "content": r["content"],
+        "agent_name": r["agent_name"],
+        "run_id": str(r["run_id"]) if r["run_id"] else None,
+    }
+
+
 class Database:
     """Thin asyncpg wrapper for the fleet schema."""
 
@@ -264,6 +317,180 @@ class Database:
                 }
                 for r in rows
             ]
+
+    async def list_runs(
+        self,
+        *,
+        agent_name: str | None,
+        status: str | None,
+        since_minutes: int,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT r.id, r.kind, r.intent, r.status, r.langfuse_trace_id,
+                       r.started_at, r.finished_at, r.summary,
+                       r.parent_run_id, a.name AS agent_name
+                FROM fleet.runs r
+                JOIN fleet.agents a ON a.id = r.agent_id
+                WHERE r.started_at >= now() - make_interval(mins => $1)
+                  AND ($2::text IS NULL OR a.name = $2)
+                  AND ($3::text IS NULL OR r.status = $3)
+                ORDER BY r.started_at DESC
+                LIMIT $4
+                """,
+                since_minutes, agent_name, status, limit,
+            )
+            return [_run_row_to_dict(r) for r in rows]
+
+    async def get_run(self, *, run_id: str) -> dict[str, Any]:
+        rid = UUID(run_id)
+        async with self.pool.acquire() as conn:
+            run_row = await conn.fetchrow(
+                """
+                SELECT r.id, r.kind, r.intent, r.status, r.langfuse_trace_id,
+                       r.started_at, r.finished_at, r.summary,
+                       r.parent_run_id, a.name AS agent_name
+                FROM fleet.runs r
+                JOIN fleet.agents a ON a.id = r.agent_id
+                WHERE r.id = $1
+                """,
+                rid,
+            )
+            event_rows = await conn.fetch(
+                """
+                SELECT e.id, e.ts, e.level, e.kind, e.payload,
+                       a.name AS agent_name, e.run_id
+                FROM fleet.events e
+                JOIN fleet.agents a ON a.id = e.agent_id
+                WHERE e.run_id = $1
+                ORDER BY e.ts ASC
+                """,
+                rid,
+            )
+            decision_rows = await conn.fetch(
+                """
+                SELECT d.id, d.ts, d.choice, d.rationale, d.payload,
+                       a.name AS agent_name, d.run_id
+                FROM fleet.decisions d
+                JOIN fleet.agents a ON a.id = d.agent_id
+                WHERE d.run_id = $1
+                ORDER BY d.ts ASC
+                """,
+                rid,
+            )
+            artifact_rows = await conn.fetch(
+                """
+                SELECT ar.id, ar.ts, ar.kind, ar.name, ar.content, ar.run_id,
+                       a.name AS agent_name
+                FROM fleet.artifacts ar
+                LEFT JOIN fleet.agents a ON a.id = ar.agent_id
+                WHERE ar.run_id = $1
+                ORDER BY ar.ts ASC
+                """,
+                rid,
+            )
+        return {
+            "run": _run_row_to_dict(run_row),
+            "events": [_event_row_to_dict(r) for r in event_rows],
+            "decisions": [_decision_row_to_dict(r) for r in decision_rows],
+            "artifacts": [_artifact_row_to_dict(r) for r in artifact_rows],
+        }
+
+    async def get_decisions(
+        self,
+        *,
+        run_id: str | None,
+        agent_name: str | None,
+        choice: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        rid = UUID(run_id) if run_id else None
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT d.id, d.ts, d.choice, d.rationale, d.payload,
+                       a.name AS agent_name, d.run_id
+                FROM fleet.decisions d
+                JOIN fleet.agents a ON a.id = d.agent_id
+                WHERE ($1::uuid IS NULL OR d.run_id = $1)
+                  AND ($2::text IS NULL OR a.name = $2)
+                  AND ($3::text IS NULL OR d.choice = $3)
+                ORDER BY d.ts DESC
+                LIMIT $4
+                """,
+                rid, agent_name, choice, limit,
+            )
+            return [_decision_row_to_dict(r) for r in rows]
+
+    async def get_locks(self) -> list[dict[str, Any]]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT resource, holder_run, acquired_at, expires_at
+                FROM fleet.locks
+                WHERE expires_at > now()
+                ORDER BY acquired_at DESC
+                """
+            )
+            return [
+                {
+                    "resource": r["resource"],
+                    "holder_run": str(r["holder_run"]) if r["holder_run"] else None,
+                    "acquired_at": r["acquired_at"].isoformat() if r["acquired_at"] else None,
+                    "expires_at": r["expires_at"].isoformat() if r["expires_at"] else None,
+                }
+                for r in rows
+            ]
+
+    async def force_release_lock(self, *, resource: str) -> bool:
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM fleet.locks WHERE resource = $1", resource
+            )
+        # asyncpg execute() returns 'DELETE <n>' for DELETE statements.
+        try:
+            n = int(result.split()[-1])
+        except (ValueError, IndexError):
+            n = 0
+        return n > 0
+
+    async def replay_run(self, *, run_id: str) -> dict[str, Any]:
+        rid = UUID(run_id)
+        base = await self.get_run(run_id=run_id)
+        parent: dict[str, Any] | None = None
+        async with self.pool.acquire() as conn:
+            if base["run"] and base["run"].get("parent_run_id"):
+                parent_row = await conn.fetchrow(
+                    """
+                    SELECT r.id, r.kind, r.intent, r.status, r.langfuse_trace_id,
+                           r.started_at, r.finished_at, r.summary,
+                           r.parent_run_id, a.name AS agent_name
+                    FROM fleet.runs r
+                    JOIN fleet.agents a ON a.id = r.agent_id
+                    WHERE r.id = $1
+                    """,
+                    UUID(base["run"]["parent_run_id"]),
+                )
+                parent = _run_row_to_dict(parent_row)
+            child_rows = await conn.fetch(
+                """
+                SELECT r.id, r.kind, r.intent, r.status, r.langfuse_trace_id,
+                       r.started_at, r.finished_at, r.summary,
+                       r.parent_run_id, a.name AS agent_name
+                FROM fleet.runs r
+                JOIN fleet.agents a ON a.id = r.agent_id
+                WHERE r.parent_run_id = $1
+                ORDER BY r.started_at ASC
+                """,
+                rid,
+            )
+        return {
+            **base,
+            "parent_run": parent,
+            "child_runs": [_run_row_to_dict(r) for r in child_rows],
+        }
 
     async def fleet_status(self) -> list[dict[str, Any]]:
         async with self.pool.acquire() as conn:
