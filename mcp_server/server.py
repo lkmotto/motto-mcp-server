@@ -427,6 +427,12 @@ def _render_dashboard(agents: list[dict[str, Any]], events: list[dict[str, Any]]
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+
+    # Mount domain servers when requested (e.g. all-in-one cluster deployment).
+    if os.environ.get("MOTTO_MCP_MOUNT_DOMAIN_SERVERS") == "1":
+        from servers.grabber.server import mcp as grabber_mcp  # noqa: PLC0415
+        mcp.mount("/grabber", grabber_mcp)
+
     port = int(os.environ.get("PORT", "8080"))
     mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
 

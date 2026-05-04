@@ -23,6 +23,7 @@ doppler = [
 [project.scripts]
 motto-mcp-server = "mcp_server.server:main"
 motto-doppler-mcp = "servers.doppler.server:main"
+motto-grabber-mcp = "servers.grabber.server:main"
 
 [build-system]
 requires = ["hatchling"]
