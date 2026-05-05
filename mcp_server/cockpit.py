@@ -351,6 +351,36 @@ def register_routes(mcp, db: Database) -> None:
         tasks = await db.list_local_tasks(status=status, kind=kind, limit=limit)
         return JSONResponse({"tasks": tasks})
 
+    @mcp.custom_route("/local/runner-heartbeat", methods=["POST"])
+    async def local_runner_heartbeat(request: Request):
+        """Lightweight HTTP shim so the laptop runner can self-register +
+        heartbeat into fleet.agents without speaking MCP. Body:
+          {"agent_name":"motto-local-<host>", "status":{"queue_depth":0,...}}
+        """
+        if not cockpit_auth_ok(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid json"}, status_code=400)
+        agent_name = body.get("agent_name")
+        if not agent_name or not isinstance(agent_name, str):
+            return JSONResponse({"error": "agent_name required"}, status_code=400)
+        try:
+            await db.upsert_agent(
+                name=agent_name,
+                kind="deterministic",
+                deploy_target="local-laptop",
+                version=str(body.get("version") or "motto-local/1"),
+            )
+            await db.heartbeat(
+                agent_name=agent_name,
+                status=body.get("status") or {},
+            )
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"ok": True})
+
     @mcp.custom_route("/local/task/{task_id}", methods=["GET"])
     async def local_task_one(request: Request):
         if not cockpit_auth_ok(request):
