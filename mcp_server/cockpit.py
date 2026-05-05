@@ -216,6 +216,11 @@ async def call_claude_max(
         "--max-turns", "1",
         "--model", model,
         "--append-system-prompt", system,
+        # Northflank containers run as root. The Claude Code CLI refuses to
+        # operate non-interactively under root unless this flag is set
+        # (see anthropics/claude-code#3490, #2951, #9184). Safe under
+        # `--max-turns 1` because no tool calls happen.
+        "--dangerously-skip-permissions",
     ]
 
     timeout_s = float(os.environ.get("CLAUDE_MAX_TIMEOUT_S", "120"))
@@ -226,7 +231,7 @@ async def call_claude_max(
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "CLAUDE_CODE_OAUTH_TOKEN": token},
+            env={**os.environ, "CLAUDE_CODE_OAUTH_TOKEN": token, "IS_SANDBOX": "1"},
             # stdin pinned to DEVNULL: the Claude Code CLI inspects stdin
             # even when `-p <text>` provides the prompt and pauses ~3s on a
             # connected pipe. In a Northflank container the inherited stdin
