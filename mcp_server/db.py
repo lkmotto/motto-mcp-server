@@ -492,6 +492,221 @@ class Database:
             "child_runs": [_run_row_to_dict(r) for r in child_rows],
         }
 
+    # ── local-task queue ────────────────────────────────────────────────────
+
+    async def queue_local_task(
+        self,
+        *,
+        kind: str,
+        payload: dict[str, Any],
+        source: str = "cockpit-user",
+        description: str | None = None,
+        dedup_key: str | None = None,
+        ttl_seconds: int = 600,
+    ) -> dict[str, Any]:
+        """Insert a task for the local runner. Returns row."""
+        async with self.pool.acquire() as conn:
+            # Dedup: if a queued/claimed task with same dedup_key exists, return it
+            if dedup_key:
+                existing = await conn.fetchrow(
+                    """
+                    SELECT id::text AS id, status FROM fleet.local_tasks
+                    WHERE dedup_key = $1
+                      AND status IN ('queued','claimed','running')
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    dedup_key,
+                )
+                if existing:
+                    return {"id": existing["id"], "status": existing["status"], "dedup_hit": True}
+            row = await conn.fetchrow(
+                """
+                INSERT INTO fleet.local_tasks
+                  (kind, payload, source, description, dedup_key, ttl_seconds)
+                VALUES ($1, $2::jsonb, $3, $4, $5, $6)
+                RETURNING id::text AS id, status, created_at
+                """,
+                kind,
+                json.dumps(payload),
+                source,
+                description,
+                dedup_key,
+                ttl_seconds,
+            )
+            return {
+                "id": row["id"],
+                "status": row["status"],
+                "created_at": row["created_at"].isoformat(),
+                "dedup_hit": False,
+            }
+
+    async def claim_local_tasks(
+        self,
+        *,
+        runner_id: str,
+        kinds: list[str] | None = None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Atomically claim queued tasks for this runner. Filters by kinds if given."""
+        async with self.pool.acquire() as conn:
+            # Sweep expired before claiming so the runner doesn't pick up stale work
+            await conn.execute("SELECT fleet.expire_local_tasks()")
+            if kinds:
+                rows = await conn.fetch(
+                    """
+                    UPDATE fleet.local_tasks
+                       SET status = 'claimed', claimed_at = now(), claimed_by = $1
+                     WHERE id IN (
+                       SELECT id FROM fleet.local_tasks
+                        WHERE status = 'queued' AND kind = ANY($2::text[])
+                        ORDER BY created_at
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT $3
+                     )
+                    RETURNING id::text AS id, kind, payload, source,
+                              description, created_at
+                    """,
+                    runner_id,
+                    kinds,
+                    limit,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    UPDATE fleet.local_tasks
+                       SET status = 'claimed', claimed_at = now(), claimed_by = $1
+                     WHERE id IN (
+                       SELECT id FROM fleet.local_tasks
+                        WHERE status = 'queued'
+                        ORDER BY created_at
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT $2
+                     )
+                    RETURNING id::text AS id, kind, payload, source,
+                              description, created_at
+                    """,
+                    runner_id,
+                    limit,
+                )
+            return [
+                {
+                    "id": r["id"],
+                    "kind": r["kind"],
+                    "payload": json.loads(r["payload"]) if isinstance(r["payload"], str) else r["payload"],
+                    "source": r["source"],
+                    "description": r["description"],
+                    "created_at": r["created_at"].isoformat(),
+                }
+                for r in rows
+            ]
+
+    async def complete_local_task(
+        self,
+        *,
+        task_id: str,
+        status: str,
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> bool:
+        """Mark task succeeded/failed/cancelled with result."""
+        if status not in ("succeeded", "failed", "cancelled"):
+            raise ValueError("status must be succeeded|failed|cancelled")
+        async with self.pool.acquire() as conn:
+            tag = await conn.execute(
+                """
+                UPDATE fleet.local_tasks
+                   SET status = $2, finished_at = now(),
+                       result = $3::jsonb, error = $4
+                 WHERE id = $1::uuid
+                   AND status IN ('claimed','running')
+                """,
+                task_id,
+                status,
+                json.dumps(result) if result is not None else None,
+                error,
+            )
+            return tag.endswith("1")
+
+    async def get_local_task(self, *, task_id: str) -> dict[str, Any] | None:
+        async with self.pool.acquire() as conn:
+            r = await conn.fetchrow(
+                """
+                SELECT id::text AS id, kind, payload, source, status,
+                       description, dedup_key, claimed_at, claimed_by,
+                       started_at, finished_at, result, error,
+                       ttl_seconds, created_at
+                FROM fleet.local_tasks
+                WHERE id = $1::uuid
+                """,
+                task_id,
+            )
+            if not r:
+                return None
+            payload = r["payload"]
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            result = r["result"]
+            if isinstance(result, str):
+                result = json.loads(result)
+            return {
+                "id": r["id"],
+                "kind": r["kind"],
+                "payload": payload,
+                "source": r["source"],
+                "status": r["status"],
+                "description": r["description"],
+                "dedup_key": r["dedup_key"],
+                "claimed_at": r["claimed_at"].isoformat() if r["claimed_at"] else None,
+                "claimed_by": r["claimed_by"],
+                "started_at": r["started_at"].isoformat() if r["started_at"] else None,
+                "finished_at": r["finished_at"].isoformat() if r["finished_at"] else None,
+                "result": result,
+                "error": r["error"],
+                "ttl_seconds": r["ttl_seconds"],
+                "created_at": r["created_at"].isoformat(),
+            }
+
+    async def list_local_tasks(
+        self,
+        *,
+        status: str | None = None,
+        kind: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id::text AS id, kind, status, source, description,
+                       dedup_key, claimed_by, created_at, finished_at,
+                       error,
+                       (result IS NOT NULL) AS has_result
+                FROM fleet.local_tasks
+                WHERE ($1::text IS NULL OR status = $1)
+                  AND ($2::text IS NULL OR kind = $2)
+                ORDER BY created_at DESC
+                LIMIT $3
+                """,
+                status,
+                kind,
+                limit,
+            )
+            return [
+                {
+                    "id": r["id"],
+                    "kind": r["kind"],
+                    "status": r["status"],
+                    "source": r["source"],
+                    "description": r["description"],
+                    "dedup_key": r["dedup_key"],
+                    "claimed_by": r["claimed_by"],
+                    "created_at": r["created_at"].isoformat(),
+                    "finished_at": r["finished_at"].isoformat() if r["finished_at"] else None,
+                    "error": r["error"],
+                    "has_result": r["has_result"],
+                }
+                for r in rows
+            ]
+
     async def fleet_status(self) -> list[dict[str, Any]]:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(

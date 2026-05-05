@@ -72,7 +72,18 @@ DIRECTOR_PERSONA = (
     "When they propose work, give a crisp plan. When they nudge an agent, "
     "summarize what you'd tell the agent and suggest the user submit "
     "that as an intent. Never invent fleet data — if something isn't in "
-    "the context, say so.\n"
+    "the context, say so.\n\n"
+    "## Local bridge\n\n"
+    "Luke has a 'local bridge' panel in the cockpit: a queue of tasks the "
+    "laptop runner picks up. Supported kinds: echo, shell, read_file, "
+    "write_file, screenshot, ocr, claude_code (spawns Claude Code locally "
+    "so quota comes from his Claude Max session, not the deployed OAuth "
+    "token), browser. When something is best done on his machine — e.g. "
+    "reviewing comp picks in his appraisal pipeline, reading a local file, "
+    "capturing the screen, or spawning a Claude Code session in a repo — "
+    "propose the exact JSON payload he should paste into that panel. "
+    "Format suggestions as a fenced ```json block so they're easy to copy. "
+    "Doctrine reminder: never auto-send emails to AMCs from any agent.\n"
 )
 
 
@@ -254,6 +265,102 @@ def register_routes(mcp, db: Database) -> None:
             }
         )
 
+    # ── Local-task HTTP endpoints (used by motto-local laptop runner) ──
+    # The runner polls /local/claim, executes tasks, then POSTs /local/complete.
+    # Same auth as everything else: ?token= or Bearer.
+
+    @mcp.custom_route("/local/claim", methods=["POST"])
+    async def local_claim(request: Request):
+        if not cockpit_auth_ok(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        runner_id = body.get("runner_id") or "motto-local"
+        kinds = body.get("kinds")
+        limit = int(body.get("limit") or 5)
+        tasks = await db.claim_local_tasks(
+            runner_id=str(runner_id),
+            kinds=kinds if isinstance(kinds, list) else None,
+            limit=limit,
+        )
+        return JSONResponse({"tasks": tasks})
+
+    @mcp.custom_route("/local/complete", methods=["POST"])
+    async def local_complete(request: Request):
+        if not cockpit_auth_ok(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid json"}, status_code=400)
+        task_id = body.get("task_id")
+        status = body.get("status")
+        if not task_id or status not in ("succeeded", "failed", "cancelled"):
+            return JSONResponse(
+                {"error": "task_id + status (succeeded|failed|cancelled) required"},
+                status_code=400,
+            )
+        try:
+            ok = await db.complete_local_task(
+                task_id=str(task_id),
+                status=str(status),
+                result=body.get("result"),
+                error=body.get("error"),
+            )
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"ok": ok})
+
+    @mcp.custom_route("/local/queue", methods=["POST"])
+    async def local_queue(request: Request):
+        """Cockpit UI / cloud agents call this to queue a task."""
+        if not cockpit_auth_ok(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid json"}, status_code=400)
+        kind = body.get("kind")
+        payload = body.get("payload") or {}
+        if not kind or not isinstance(payload, dict):
+            return JSONResponse(
+                {"error": "kind + payload (object) required"}, status_code=400
+            )
+        try:
+            row = await db.queue_local_task(
+                kind=str(kind),
+                payload=payload,
+                source=str(body.get("source") or "cockpit-user"),
+                description=body.get("description"),
+                dedup_key=body.get("dedup_key"),
+                ttl_seconds=int(body.get("ttl_seconds") or 600),
+            )
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse(row)
+
+    @mcp.custom_route("/local/tasks.json", methods=["GET"])
+    async def local_tasks_json(request: Request):
+        if not cockpit_auth_ok(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        status = request.query_params.get("status")
+        kind = request.query_params.get("kind")
+        limit = int(request.query_params.get("limit") or 50)
+        tasks = await db.list_local_tasks(status=status, kind=kind, limit=limit)
+        return JSONResponse({"tasks": tasks})
+
+    @mcp.custom_route("/local/task/{task_id}", methods=["GET"])
+    async def local_task_one(request: Request):
+        if not cockpit_auth_ok(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        task_id = request.path_params["task_id"]
+        task = await db.get_local_task(task_id=task_id)
+        if not task:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return JSONResponse(task)
+
     @mcp.custom_route("/cockpit/intent", methods=["POST"])
     async def cockpit_intent(request: Request):
         if not cockpit_auth_ok(request):
@@ -430,6 +537,28 @@ def _render_cockpit(token: str) -> str:
           <button class="ghost" data-target="motto-director" data-kind="merge-greenlit">merge greenlit PRs</button>
           <button class="ghost" data-target="motto-sdr-agent" data-kind="dry-run">SDR dry-run</button>
         </div>
+      </div>
+
+      <div class="panel">
+        <h2>local bridge <span id="local-status" style="font-weight:400;font-size:11px">no runner detected</span></h2>
+        <form id="local-form" style="padding:10px 14px;">
+          <select id="l-kind" style="background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--fg);font-size:12px;width:100%;margin-bottom:6px;">
+            <option value="echo">echo · sanity ping</option>
+            <option value="shell">shell · run a command</option>
+            <option value="read_file">read_file · path</option>
+            <option value="write_file">write_file · path + content</option>
+            <option value="screenshot">screenshot · capture screen</option>
+            <option value="ocr">ocr · path → text</option>
+            <option value="claude_code">claude_code · prompt</option>
+            <option value="browser">browser · url + action</option>
+          </select>
+          <textarea id="l-payload" placeholder='payload JSON (e.g. {{"cmd":"ls -la"}})' style="background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--fg);font-size:12px;width:100%;min-height:50px;font-family:inherit;"></textarea>
+          <div style="display:flex;gap:8px;align-items:center;margin-top:6px;">
+            <button type="submit">queue local task</button>
+            <span id="local-result" style="font-size:12px;"></span>
+          </div>
+        </form>
+        <div class="body" id="local-body" style="max-height:240px">no tasks yet</div>
       </div>
 
       <div class="panel" style="flex:1">
@@ -632,9 +761,93 @@ document.querySelectorAll(".quick-btns button").forEach(btn => {{
   }});
 }});
 
+// ── Local bridge ─────────────────────────────────────────────
+const LOCAL_PAYLOAD_HINTS = {{
+  echo: '{{"msg":"hello from cockpit"}}',
+  shell: '{{"cmd":"ls -la","cwd":"~"}}',
+  read_file: '{{"path":"/Users/luke/something.txt"}}',
+  write_file: '{{"path":"/tmp/test.txt","content":"hello"}}',
+  screenshot: '{{}}',
+  ocr: '{{"path":"/tmp/screenshot.png"}}',
+  claude_code: '{{"prompt":"review the comp picks in this appraisal","cwd":"~/projects/motto"}}',
+  browser: '{{"url":"https://example.com","action":"screenshot"}}'
+}};
+
+document.getElementById("l-kind").addEventListener("change", (ev) => {{
+  const ta = document.getElementById("l-payload");
+  if (!ta.value.trim()) ta.value = LOCAL_PAYLOAD_HINTS[ev.target.value] || "{{}}";
+}});
+document.getElementById("l-payload").value = LOCAL_PAYLOAD_HINTS.echo;
+
+async function refreshLocal() {{
+  try {{
+    const r = await fetch("/local/tasks.json" + (Q ? Q + "&" : "?") + "limit=15");
+    if (!r.ok) return;
+    const d = await r.json();
+    const body = document.getElementById("local-body");
+    const status = document.getElementById("local-status");
+    if (!d.tasks || !d.tasks.length) {{
+      body.innerHTML = "<i>no tasks yet</i>";
+      status.textContent = "queue empty";
+      return;
+    }}
+    const claimed = d.tasks.filter(t => t.claimed_by).map(t => t.claimed_by);
+    const runners = [...new Set(claimed)];
+    status.textContent = runners.length ? ("runner: " + runners.join(", ")) : "no runner has claimed yet";
+    let html = "<table><tr><th>when</th><th>kind</th><th>status</th><th>desc</th></tr>";
+    for (const t of d.tasks) {{
+      const cls = t.status === "succeeded" ? "ok" : (t.status === "failed" ? "err" : (t.status === "running" || t.status === "claimed" ? "accent" : ""));
+      const desc = t.description || (t.error ? t.error.slice(0, 60) : (t.kind + (t.claimed_by ? " → " + t.claimed_by : "")));
+      html += "<tr>" +
+        "<td title='" + escapeHtml(t.created_at || "") + "'>" + fmtAge(t.created_at) + "</td>" +
+        "<td><code>" + escapeHtml(t.kind) + "</code></td>" +
+        "<td><span class='" + cls + "'>" + escapeHtml(t.status) + "</span></td>" +
+        "<td><code title='" + escapeHtml(t.id || "") + "'>" + escapeHtml(desc) + "</code></td>" +
+        "</tr>";
+    }}
+    html += "</table>";
+    body.innerHTML = html;
+  }} catch (err) {{
+    // silent
+  }}
+}}
+
+document.getElementById("local-form").addEventListener("submit", async (ev) => {{
+  ev.preventDefault();
+  const kind = document.getElementById("l-kind").value;
+  const payloadRaw = document.getElementById("l-payload").value.trim();
+  let payload = {{}};
+  if (payloadRaw) {{
+    try {{ payload = JSON.parse(payloadRaw); }}
+    catch {{
+      document.getElementById("local-result").innerHTML = "<span class='err'>invalid JSON</span>";
+      return;
+    }}
+  }}
+  document.getElementById("local-result").textContent = "queueing…";
+  try {{
+    const r = await fetch("/local/queue" + Q, {{
+      method: "POST",
+      headers: {{"content-type":"application/json"}},
+      body: JSON.stringify({{kind, payload, source: "cockpit-user"}})
+    }});
+    const d = await r.json();
+    if (d.id) {{
+      document.getElementById("local-result").innerHTML = "<span class='ok'>queued · " + escapeHtml(d.id.slice(0,8)) + "</span>";
+      refreshLocal();
+    }} else {{
+      document.getElementById("local-result").innerHTML = "<span class='err'>" + escapeHtml(d.error || "failed") + "</span>";
+    }}
+  }} catch (err) {{
+    document.getElementById("local-result").innerHTML = "<span class='err'>" + escapeHtml(err.message) + "</span>";
+  }}
+}});
+
 // Initial load + poll
 refreshState();
+refreshLocal();
 setInterval(refreshState, 15000);
+setInterval(refreshLocal, 5000);
 
 // Welcome
 addChatMsg("assistant", "I'm the Motto Director. I can see live fleet state in my context. Ask me what's happening, what to do next, or describe a nudge you want to send.");
