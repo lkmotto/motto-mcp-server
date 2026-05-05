@@ -223,9 +223,17 @@ async def call_claude_max(
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={**os.environ, "CLAUDE_CODE_OAUTH_TOKEN": token},
+            # stdin pinned to DEVNULL: the Claude Code CLI inspects stdin
+            # even when `-p <text>` provides the prompt and pauses ~3s on a
+            # connected pipe. In a Northflank container the inherited stdin
+            # is a closed/orphan TTY, which produces:
+            #   "no stdin data received in 3s, proceeding without it"
+            # followed by exit=1. Pinning to DEVNULL is the documented fix.
+            # (Reproduced in motto-director run 3dd3a015 on 2026-05-05.)
         )
         try:
             stdout_b, stderr_b = await asyncio.wait_for(
