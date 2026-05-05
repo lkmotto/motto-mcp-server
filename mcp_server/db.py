@@ -90,9 +90,9 @@ class Database:
         self._pool: asyncpg.Pool | None = None
 
     async def connect(self) -> None:
-        url = os.environ.get("DATABASE_URL")
+        url = os.environ.get("DATABASE_URL") or os.environ.get("NEON_DATABASE_URL")
         if not url:
-            raise RuntimeError("DATABASE_URL is required")
+            raise RuntimeError("DATABASE_URL (or NEON_DATABASE_URL) is required")
         self._pool = await asyncpg.create_pool(
             url, min_size=1, max_size=10, init=_init_conn
         )
