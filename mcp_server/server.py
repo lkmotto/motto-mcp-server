@@ -10,6 +10,10 @@ Run: `motto-mcp-server` (HTTP on $PORT). Schema is auto-applied on start.
 HTTP surface:
     /mcp/                       FastMCP streamable-http transport (auth required)
     /dashboard                  Read-only HTML fleet dashboard (auth required)
+    /cockpit                    Interactive cockpit UI (chat + intent submit)
+    /cockpit/state.json         Cockpit live state (auth required)
+    /cockpit/chat               POST: chat with director (Claude Max OAuth)
+    /cockpit/intent             POST: submit a manual intent / nudge
     /fleet/status.json          Same data as /dashboard but JSON (auth required)
     /healthz                    Liveness probe (open)
 
@@ -34,6 +38,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from .db import Database
+from .cockpit import register_routes as _register_cockpit_routes
 
 logger = logging.getLogger(__name__)
 
@@ -423,6 +428,10 @@ def _render_dashboard(agents: list[dict[str, Any]], events: list[dict[str, Any]]
     {event_rows}
   </table>
 </body></html>"""
+
+
+# Cockpit routes (chat with director + intent submit + live state)
+_register_cockpit_routes(mcp, db)
 
 
 def main() -> None:
