@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 from datetime import datetime, timezone
 from html import escape as h
 from typing import Any
@@ -135,9 +136,35 @@ async def call_claude_max(
     system: str,
     messages: list[dict[str, str]],
     model: str = "claude-sonnet-4-5",
-    max_tokens: int = 1024,
+    max_tokens: int = 1024,  # accepted for API parity; not passed to CLI
 ) -> dict[str, Any]:
-    """POST to api.anthropic.com using the OAuth token. Returns parsed JSON."""
+    """Run the Claude Code CLI as a subprocess.
+
+    Anthropic blocked direct OAuth POSTs to /v1/messages on 2026-01-09; the
+    supported integration path for Claude Max-billed inference is the
+    Claude Code CLI. This shim runs:
+
+        claude -p <user> --output-format json --max-turns 1 \
+               --model <model> --append-system-prompt <system>
+
+    Critical: --append-system-prompt (NOT --system-prompt). The latter
+    strips Claude Code's identity prefix and silently bills the API
+    instead of Claude Max.
+
+    CLAUDE_CODE_OAUTH_TOKEN must be set in the process env; the CLI
+    picks it up automatically.
+
+    `messages` is collapsed into a single transcript on the user side
+    of the prompt because --max-turns 1 is non-interactive. We keep
+    the full chat history visible to the model so it can answer
+    follow-ups in context.
+
+    Returns a dict shaped like the old /v1/messages response so callers
+    (and `_extract_text`) don't need to change:
+        success  -> {type: "message", content: [{type: "text", text: ...}],
+                     model, usage, ...}
+        error    -> {error: "...", type: "config_error"|"upstream_error"|...}
+    """
     token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
     if not token:
         return {
@@ -145,37 +172,131 @@ async def call_claude_max(
             "type": "config_error",
         }
 
-    body = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "system": CLAUDE_CODE_SYSTEM_PREFIX + system,
-        "messages": messages,
-    }
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "anthropic-version": "2023-06-01",
-        "anthropic-beta": "oauth-2025-04-20",
-        "content-type": "application/json",
-    }
+    cli_bin = os.environ.get("CLAUDE_CLI_BIN", "claude")
+    if shutil.which(cli_bin) is None:
+        return {
+            "error": f"`{cli_bin}` CLI not on PATH inside the container",
+            "type": "config_error",
+        }
+
+    # Collapse the history into a transcript. The last user turn is the
+    # actual question; earlier turns become context above it.
+    if not messages:
+        return {"error": "no messages", "type": "config_error"}
+
+    last = messages[-1]
+    if last.get("role") != "user":
+        return {
+            "error": "last message must be from the user",
+            "type": "config_error",
+        }
+
+    transcript_lines: list[str] = []
+    for m in messages[:-1]:
+        role = m.get("role", "user").upper()
+        content = m.get("content", "")
+        transcript_lines.append(f"[{role}]\n{content}")
+    if transcript_lines:
+        user_prompt = (
+            "# Prior conversation\n"
+            + "\n\n".join(transcript_lines)
+            + "\n\n# Current message\n"
+            + last.get("content", "")
+        )
+    else:
+        user_prompt = last.get("content", "")
+
+    # We deliberately do NOT prepend CLAUDE_CODE_SYSTEM_PREFIX here — the
+    # CLI already starts every conversation with its Claude Code identity
+    # prompt, and --append-system-prompt adds ours after it.
+    cmd = [
+        cli_bin,
+        "-p", user_prompt,
+        "--output-format", "json",
+        "--max-turns", "1",
+        "--model", model,
+        "--append-system-prompt", system,
+    ]
+
+    timeout_s = float(os.environ.get("CLAUDE_MAX_TIMEOUT_S", "120"))
+
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            r = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                json=body,
-                headers=headers,
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "CLAUDE_CODE_OAUTH_TOKEN": token},
+        )
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout_s
             )
-        data = r.json()
-        if r.status_code != 200:
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
             return {
-                "error": f"upstream {r.status_code}",
-                "type": "upstream_error",
-                "status_code": r.status_code,
-                "detail": data,
+                "error": f"claude CLI timed out after {timeout_s}s",
+                "type": "timeout_error",
             }
-        return data
+    except FileNotFoundError as exc:
+        return {"error": str(exc), "type": "config_error"}
     except Exception as e:  # pragma: no cover
-        logger.exception("claude_max call failed")
+        logger.exception("claude_max subprocess launch failed")
         return {"error": str(e), "type": "transport_error"}
+
+    if proc.returncode != 0:
+        stderr_s = (stderr_b or b"").decode("utf-8", "replace")[:1000]
+        return {
+            "error": f"claude CLI exited {proc.returncode}",
+            "type": "upstream_error",
+            "status_code": 502,
+            "detail": stderr_s,
+        }
+
+    stdout_s = (stdout_b or b"").decode("utf-8", "replace").strip()
+    if not stdout_s:
+        return {
+            "error": "claude CLI returned empty stdout",
+            "type": "upstream_error",
+            "status_code": 502,
+        }
+
+    try:
+        envelope = json.loads(stdout_s)
+    except json.JSONDecodeError as exc:
+        return {
+            "error": f"could not parse claude CLI JSON: {exc}",
+            "type": "upstream_error",
+            "status_code": 502,
+            "detail": stdout_s[:500],
+        }
+
+    # The CLI envelope is shaped like:
+    #   {"type":"result","subtype":"success","result":"<text>",
+    #    "session_id":"...","usage":{...},"total_cost_usd":...,"model":"..."}
+    if isinstance(envelope, dict) and envelope.get("subtype") == "success":
+        text = envelope.get("result") or ""
+        return {
+            "type": "message",
+            "content": [{"type": "text", "text": text}],
+            "model": envelope.get("model") or model,
+            "usage": envelope.get("usage") or {},
+            "session_id": envelope.get("session_id"),
+            "total_cost_usd": envelope.get("total_cost_usd"),
+        }
+
+    # Some envelopes use "is_error" or surface the failure differently.
+    err_msg = (
+        envelope.get("error")
+        if isinstance(envelope, dict)
+        else None
+    ) or stdout_s[:300]
+    return {
+        "error": f"claude CLI returned non-success: {err_msg}",
+        "type": "upstream_error",
+        "status_code": 502,
+        "detail": envelope,
+    }
 
 
 def _extract_text(resp: dict[str, Any]) -> str:
