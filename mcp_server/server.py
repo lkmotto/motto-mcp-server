@@ -251,6 +251,76 @@ async def replay_run(run_id: str) -> dict[str, Any]:
     return await db.replay_run(run_id=run_id)
 
 
+# ── local-task queue (motto-local laptop bridge) ────────────────────────────────────
+
+
+@mcp.tool
+async def queue_local_task(
+    kind: str,
+    payload: dict[str, Any],
+    description: str | None = None,
+    source: str = "motto-director",
+    dedup_key: str | None = None,
+    ttl_seconds: int = 600,
+) -> dict[str, Any]:
+    """Queue a task for the user's local runner (motto-local).
+
+    Standard kinds the runner supports: 'shell', 'read_file', 'write_file',
+    'screenshot', 'ocr', 'claude_code', 'browser', 'echo'. The runner
+    polls every ~1s and executes claimed tasks on the user's laptop.
+    """
+    return await db.queue_local_task(
+        kind=kind,
+        payload=payload,
+        source=source,
+        description=description,
+        dedup_key=dedup_key,
+        ttl_seconds=ttl_seconds,
+    )
+
+
+@mcp.tool
+async def claim_local_tasks(
+    runner_id: str,
+    kinds: list[str] | None = None,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Atomically claim queued tasks for a local runner. Used by motto-local
+    every poll cycle.
+    """
+    return await db.claim_local_tasks(runner_id=runner_id, kinds=kinds, limit=limit)
+
+
+@mcp.tool
+async def complete_local_task(
+    task_id: str,
+    status: str,
+    result: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> dict[str, bool]:
+    """Mark a local task succeeded/failed/cancelled with its result."""
+    ok = await db.complete_local_task(
+        task_id=task_id, status=status, result=result, error=error
+    )
+    return {"ok": ok}
+
+
+@mcp.tool
+async def get_local_task(task_id: str) -> dict[str, Any] | None:
+    """Fetch a local task's full record including its result."""
+    return await db.get_local_task(task_id=task_id)
+
+
+@mcp.tool
+async def list_local_tasks(
+    status: str | None = None,
+    kind: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Recent local tasks, newest first. Filter by status and/or kind."""
+    return await db.list_local_tasks(status=status, kind=kind, limit=limit)
+
+
 # ── HTTP custom routes (dashboard + status JSON + healthz) ─────────────────────────────────────
 
 
