@@ -1,0 +1,74 @@
+name: deploy-northflank
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Durable redeploy path. The Northflank-side VCS auto-rebuild has been
+# unreliable on this org (proven 2026-05-05 when motto-director PR #21
+# merged here without a single rebuild firing). Owning the trigger from
+# GitHub Actions makes the deploy contract explicit.
+#
+# Endpoint: POST /v1/projects/{project}/services/{service}/build
+#           body {"sha": "<40-char>"}
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: nf-deploy-motto-mcp-server
+      cancel-in-progress: false
+    steps:
+      - name: Trigger Northflank build
+        env:
+          NORTHFLANK_API_KEY: ${{ secrets.NORTHFLANK_API_KEY || secrets.NORTHFLANK_API }}
+          PROJECT_ID: motto-agents
+          SERVICE_ID: motto-mcp-server
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "$NORTHFLANK_API_KEY" ]; then
+            echo "::error::NORTHFLANK_API_KEY (or NORTHFLANK_API) not set on this repo"
+            exit 1
+          fi
+
+          echo "Triggering NF build for $PROJECT_ID/$SERVICE_ID @ $COMMIT_SHA"
+
+          # Step 1: start the build.
+          resp=$(curl -fsS -X POST \
+            -H "Authorization: Bearer $NORTHFLANK_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"sha\":\"$COMMIT_SHA\"}" \
+            "https://api.northflank.com/v1/projects/$PROJECT_ID/services/$SERVICE_ID/build")
+
+          BUILD_ID=$(echo "$resp" | jq -r '.data.id')
+          echo "Build queued: $BUILD_ID"
+          echo "$resp" | jq '.data | {id, branch, status, sha, createdAt}'
+
+          # Step 2: poll until the build concludes (success or failure).
+          for i in $(seq 1 72); do
+            sleep 10
+            status=$(curl -fsS -H "Authorization: Bearer $NORTHFLANK_API_KEY" \
+              "https://api.northflank.com/v1/projects/$PROJECT_ID/services/$SERVICE_ID/build/$BUILD_ID" \
+              | jq -r '.data.status')
+            echo "  poll $i: status=$status"
+            if [ "$status" = "SUCCESS" ]; then
+              break
+            fi
+            if [ "$status" = "FAILURE" ] || [ "$status" = "CRASHED" ] || [ "$status" = "ABORTED" ] || [ "$status" = "SUBMISSION_FAILURE" ]; then
+              echo "::error::Build $BUILD_ID concluded with status=$status"
+              exit 1
+            fi
+          done
+
+          # Step 3: deploy the built image so the running service rolls over.
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $NORTHFLANK_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"internal\":{\"buildId\":\"$BUILD_ID\"}}" \
+            "https://api.northflank.com/v1/projects/$PROJECT_ID/services/$SERVICE_ID/deployment" >/dev/null
+          echo "Deploy issued for build $BUILD_ID."
