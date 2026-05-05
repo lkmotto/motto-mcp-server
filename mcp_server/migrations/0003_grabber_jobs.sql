@@ -11,7 +11,7 @@ create table if not exists fleet.grabber_jobs (
   started_at   timestamptz,
   ended_at     timestamptz,
   error_class  text,
-  audit_decision_id uuid references fleet.decisions(id) on delete set null
+  audit_decision_id bigint references fleet.decisions(id) on delete set null
 );
 create index if not exists grabber_jobs_status_created on fleet.grabber_jobs(status, created_at desc);
 
