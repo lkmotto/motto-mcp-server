@@ -16,6 +16,7 @@ so motto-director will pick it up on the next consume_open_intents call.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -390,6 +391,102 @@ def register_routes(mcp, db: Database) -> None:
         if not task:
             return JSONResponse({"error": "not found"}, status_code=404)
         return JSONResponse(task)
+
+    # ── Long-polling endpoints ────────────────────────────────────────────────
+
+    _LONGPOLL_MAX_S_DEFAULT: int = int(os.environ.get("LOCAL_LONGPOLL_MAX_S", "25"))
+    _LONGPOLL_CAP_S: int = 60
+    _LONGPOLL_POLL_INTERVAL_S: float = 0.2
+    _TERMINAL_STATUSES: frozenset[str] = frozenset({"succeeded", "failed", "cancelled"})
+
+    @mcp.custom_route("/local/claim/long-poll", methods=["POST"])
+    async def local_claim_long_poll(request: Request):
+        """Like POST /local/claim but holds the connection open until at least
+        one task is claimable or the deadline elapses (returns empty list).
+
+        Query params:
+            max_wait_s  Override wait duration (capped at 60 s).
+        """
+        if not cockpit_auth_ok(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        runner_id = body.get("runner_id") or "motto-local"
+        kinds = body.get("kinds")
+        limit = int(body.get("limit") or 5)
+
+        raw_max = request.query_params.get("max_wait_s")
+        max_wait_s = min(
+            float(raw_max) if raw_max is not None else _LONGPOLL_MAX_S_DEFAULT,
+            _LONGPOLL_CAP_S,
+        )
+
+        deadline = asyncio.get_event_loop().time() + max_wait_s
+
+        while True:
+            # Bail early if client disconnected.
+            if await request.is_disconnected():
+                return JSONResponse({"tasks": []})
+
+            tasks = await db.claim_local_tasks(
+                runner_id=str(runner_id),
+                kinds=kinds if isinstance(kinds, list) else None,
+                limit=limit,
+            )
+            if tasks:
+                return JSONResponse({"tasks": tasks})
+
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                return JSONResponse({"tasks": []})
+
+            await asyncio.sleep(min(_LONGPOLL_POLL_INTERVAL_S, remaining))
+
+    @mcp.custom_route("/local/task/{task_id}/wait", methods=["GET"])
+    async def local_task_wait(request: Request):
+        """Like GET /local/task/{task_id} but holds the connection open until
+        the task reaches a terminal status (succeeded/failed/cancelled) or the
+        deadline elapses.  If the task is already terminal, returns immediately.
+
+        Query params:
+            max_wait_s  Override wait duration (capped at 60 s).
+        """
+        if not cockpit_auth_ok(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        task_id = request.path_params["task_id"]
+
+        raw_max = request.query_params.get("max_wait_s")
+        max_wait_s = min(
+            float(raw_max) if raw_max is not None else _LONGPOLL_MAX_S_DEFAULT,
+            _LONGPOLL_CAP_S,
+        )
+
+        deadline = asyncio.get_event_loop().time() + max_wait_s
+
+        while True:
+            # Bail early if client disconnected.
+            if await request.is_disconnected():
+                task = await db.get_local_task(task_id=task_id)
+                if task:
+                    return JSONResponse(task)
+                return JSONResponse({"error": "not found"}, status_code=404)
+
+            task = await db.get_local_task(task_id=task_id)
+            if not task:
+                return JSONResponse({"error": "not found"}, status_code=404)
+
+            if task.get("status") in _TERMINAL_STATUSES:
+                return JSONResponse(task)
+
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                return JSONResponse(task)
+
+            await asyncio.sleep(min(_LONGPOLL_POLL_INTERVAL_S, remaining))
 
     @mcp.custom_route("/cockpit/intent", methods=["POST"])
     async def cockpit_intent(request: Request):
