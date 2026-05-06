@@ -618,6 +618,95 @@ def register_routes(mcp, db: Database) -> None:
 
         return JSONResponse({"intent_id": str(intent_id), "ok": True})
 
+    # ── Director approval queue (motto-director PR #41) ─────────────────
+    # Surfaces public.pending_moves rows so a human can approve / reject
+    # before motto-director auto-acts. Same auth as everything else.
+
+    def _approver_id(request: Request) -> str:
+        token = (
+            request.query_params.get("token")
+            or request.headers.get("authorization", "").removeprefix("Bearer ")
+        )
+        # Don't echo the full token — a stable short fingerprint is enough.
+        return f"cockpit:{token[:8]}" if token else "cockpit:anon"
+
+    @mcp.custom_route("/cockpit/director/pending.json", methods=["GET"])
+    async def director_pending(request: Request):
+        if not cockpit_auth_ok(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        status = request.query_params.get("status") or "pending"
+        try:
+            limit = int(request.query_params.get("limit") or 100)
+        except ValueError:
+            limit = 100
+        try:
+            moves = await db.director_pending_moves(
+                status=str(status), limit=min(limit, 500),
+            )
+            counts = await db.director_pending_counts()
+        except Exception as e:
+            logger.exception("director_pending failed")
+            return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"moves": moves, "counts": counts})
+
+    @mcp.custom_route("/cockpit/director/approve", methods=["POST"])
+    async def director_approve(request: Request):
+        if not cockpit_auth_ok(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid json"}, status_code=400)
+        move_id = body.get("move_id")
+        ids = body.get("move_ids")
+        approved_by = _approver_id(request)
+        try:
+            if isinstance(ids, list) and ids:
+                int_ids = [int(i) for i in ids]
+                n = await db.director_bulk_approve(
+                    move_ids=int_ids, approved_by=approved_by,
+                )
+                return JSONResponse({"approved": int(n)})
+            if move_id is None:
+                return JSONResponse(
+                    {"error": "move_id or move_ids required"}, status_code=400
+                )
+            ok = await db.director_approve_move(
+                move_id=int(move_id), approved_by=approved_by,
+            )
+            return JSONResponse({"approved": 1 if ok else 0})
+        except Exception as e:
+            logger.exception("director_approve failed")
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @mcp.custom_route("/cockpit/director/reject", methods=["POST"])
+    async def director_reject(request: Request):
+        if not cockpit_auth_ok(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid json"}, status_code=400)
+        move_id = body.get("move_id")
+        if move_id is None:
+            return JSONResponse({"error": "move_id required"}, status_code=400)
+        approved_by = _approver_id(request)
+        try:
+            ok = await db.director_reject_move(
+                move_id=int(move_id), approved_by=approved_by,
+            )
+        except Exception as e:
+            logger.exception("director_reject failed")
+            return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"rejected": 1 if ok else 0})
+
+    @mcp.custom_route("/cockpit/director", methods=["GET"])
+    async def director_ui(request: Request):
+        if not cockpit_auth_ok(request):
+            return _unauth_html()
+        token = request.query_params.get("token", "")
+        return HTMLResponse(_render_director(token))
+
 
 # ── Single-page UI ────────────────────────────────────────────────────────────
 
@@ -1129,5 +1218,316 @@ setInterval(refreshLocal, 5000);
 
 // Welcome
 addChatMsg("assistant", "I'm the Motto Director. I can see live fleet state in my context. Ask me what's happening, what to do next, or describe a nudge you want to send.");
+</script>
+</body></html>"""
+
+
+def _render_director(token: str) -> str:
+    """Director approval queue UI — list pending moves, approve/reject, bulk."""
+    safe_token = h(token)
+    return f"""<!DOCTYPE html>
+<html><head>
+  <title>motto director · approvals</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    :root {{
+      --bg: #0e1116; --panel: #161b22; --border: #2d333b;
+      --fg: #e6edf3; --muted: #7d8590; --accent: #2f81f7;
+      --ok: #3fb950; --warn: #d29922; --err: #f85149;
+      --kind-issue: #d29922; --kind-spawn: #2f81f7;
+      --kind-merge: #3fb950; --kind-nudge: #a371f7;
+      --kind-compound: #f78166;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg); color: var(--fg); font-size: 14px; min-height: 100vh;
+    }}
+    .top {{
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--panel);
+      flex-wrap: wrap; gap: 8px;
+    }}
+    .top h1 {{ margin: 0; font-size: 16px; font-weight: 600; }}
+    .top a {{ color: var(--accent); text-decoration: none; font-size: 12px; }}
+    .top .meta {{ color: var(--muted); font-size: 12px; }}
+    .toolbar {{
+      display: flex; gap: 8px; padding: 10px 16px;
+      border-bottom: 1px solid var(--border); background: var(--panel);
+      flex-wrap: wrap; align-items: center;
+    }}
+    .toolbar select, .toolbar button {{
+      background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+      padding: 6px 12px; border-radius: 6px; font-size: 13px; cursor: pointer;
+    }}
+    .toolbar button:hover {{ border-color: var(--accent); }}
+    .toolbar .counts {{ color: var(--muted); font-size: 12px; margin-left: auto; }}
+    .toolbar .counts span {{ margin-left: 10px; }}
+    .toolbar .counts .pending {{ color: var(--warn); }}
+    .toolbar .counts .approved {{ color: var(--accent); }}
+    .toolbar .counts .applied {{ color: var(--ok); }}
+    .toolbar .counts .rejected {{ color: var(--err); }}
+    .list {{ padding: 12px; display: flex; flex-direction: column; gap: 10px; }}
+    .move {{
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 8px; padding: 12px; display: flex; gap: 12px;
+      align-items: flex-start;
+    }}
+    .move .check {{ flex-shrink: 0; margin-top: 4px; }}
+    .move .body {{ flex: 1; min-width: 0; }}
+    .move .head {{
+      display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+      margin-bottom: 6px;
+    }}
+    .move .head .priority {{
+      background: #21262d; color: var(--muted); padding: 2px 6px;
+      border-radius: 4px; font-size: 11px; font-family: ui-monospace, monospace;
+    }}
+    .move .head .priority.p-high {{ background: #6e1c1c; color: #ffeded; }}
+    .move .head .priority.p-med  {{ background: #5a3a09; color: #ffe5b4; }}
+    .move .head .repo {{
+      color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace;
+    }}
+    .move .head .kind {{
+      padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.4px; color: #fff;
+    }}
+    .move .head .kind.file_issue {{ background: var(--kind-issue); }}
+    .move .head .kind.spawn_session {{ background: var(--kind-spawn); }}
+    .move .head .kind.merge_pr {{ background: var(--kind-merge); }}
+    .move .head .kind.nudge_pipeline {{ background: var(--kind-nudge); }}
+    .move .head .kind.compound_pr {{ background: var(--kind-compound); }}
+    .move .head .kind.noop {{ background: var(--muted); }}
+    .move .title {{
+      font-weight: 600; font-size: 14px; margin: 0 0 4px;
+      word-break: break-word;
+    }}
+    .move .rationale {{
+      color: var(--muted); font-size: 13px; line-height: 1.45;
+      word-break: break-word;
+    }}
+    .move .rationale.long {{
+      max-height: 4.5em; overflow: hidden; position: relative;
+    }}
+    .move .rationale.expanded {{ max-height: none; }}
+    .move .show-more {{
+      color: var(--accent); font-size: 12px; cursor: pointer;
+      background: none; border: none; padding: 0; margin-top: 4px;
+    }}
+    .move .footer {{
+      margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap;
+      align-items: center;
+    }}
+    .move .footer .meta {{
+      color: var(--muted); font-size: 11px; margin-right: auto;
+      font-family: ui-monospace, monospace;
+    }}
+    .move .footer button {{
+      background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+      padding: 5px 12px; border-radius: 6px; font-size: 12px; cursor: pointer;
+      font-weight: 500;
+    }}
+    .move .footer button.approve {{ border-color: var(--ok); color: var(--ok); }}
+    .move .footer button.approve:hover {{ background: var(--ok); color: #fff; }}
+    .move .footer button.reject {{ border-color: var(--err); color: var(--err); }}
+    .move .footer button.reject:hover {{ background: var(--err); color: #fff; }}
+    .move .footer button:disabled {{
+      opacity: 0.5; cursor: not-allowed;
+    }}
+    .empty {{
+      padding: 40px; text-align: center; color: var(--muted);
+    }}
+    .err-banner {{
+      background: #3d1d1d; color: var(--err); padding: 10px 16px;
+      border-bottom: 1px solid var(--err); font-size: 13px;
+    }}
+    /* mobile */
+    @media (max-width: 640px) {{
+      body {{ font-size: 15px; }}
+      .top {{ padding: 8px 12px; }}
+      .toolbar {{ padding: 8px 12px; gap: 6px; }}
+      .toolbar .counts {{ flex-basis: 100%; margin-left: 0; }}
+      .toolbar .counts span {{ margin-left: 0; margin-right: 10px; }}
+      .toolbar select, .toolbar button {{ font-size: 13px; padding: 8px 12px; }}
+      .list {{ padding: 8px; }}
+      .move {{ padding: 10px; }}
+      .move .footer {{ gap: 4px; }}
+      .move .footer .meta {{ flex-basis: 100%; margin-right: 0; }}
+      .move .footer button {{ flex: 1; padding: 8px; }}
+    }}
+  </style>
+</head><body>
+  <div class="top">
+    <div>
+      <h1>director · approvals</h1>
+      <div class="meta">pending moves awaiting human review</div>
+    </div>
+    <div><a href="/cockpit?token={safe_token}">← back to cockpit</a></div>
+  </div>
+  <div class="toolbar">
+    <select id="status-filter">
+      <option value="pending" selected>pending</option>
+      <option value="approved">approved</option>
+      <option value="applied">applied</option>
+      <option value="rejected">rejected</option>
+      <option value="failed">failed</option>
+      <option value="expired">expired</option>
+    </select>
+    <button id="refresh-btn">refresh</button>
+    <button id="approve-all-btn">approve all visible</button>
+    <span class="counts" id="counts"></span>
+  </div>
+  <div id="err-banner"></div>
+  <div class="list" id="moves-list">
+    <div class="empty">loading…</div>
+  </div>
+<script>
+const Q = "?token=" + encodeURIComponent("{safe_token}");
+
+function escapeHtml(s) {{
+  return String(s == null ? "" : s)
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+    .replace(/"/g,"&quot;").replace(/'/g,"&#39;");
+}}
+
+function priorityClass(p) {{
+  if (p >= 8) return "p-high";
+  if (p >= 5) return "p-med";
+  return "";
+}}
+
+function renderCounts(c) {{
+  const el = document.getElementById("counts");
+  if (!c) {{ el.textContent = ""; return; }}
+  const parts = [];
+  for (const k of ["pending","approved","applied","rejected","failed","expired"]) {{
+    if (c[k]) parts.push('<span class="' + k + '">' + k + ': ' + c[k] + '</span>');
+  }}
+  el.innerHTML = parts.join("");
+}}
+
+function renderMove(m) {{
+  const pCls = priorityClass(m.priority || 0);
+  const isPending = m.status === "pending";
+  const rationale = m.rationale || "";
+  const long = rationale.length > 200;
+  const meta = (m.created_at ? m.created_at.replace("T"," ").slice(0,16) + " · " : "")
+             + "id " + m.id
+             + (m.run_id ? " · run " + String(m.run_id).slice(0,8) : "");
+  const approveDisabled = !isPending ? "disabled" : "";
+  const rejectDisabled = !isPending ? "disabled" : "";
+  return `
+    <div class="move" data-id="${{m.id}}">
+      ${{isPending ? '<input type="checkbox" class="check" data-id="' + m.id + '">' : ''}}
+      <div class="body">
+        <div class="head">
+          <span class="priority ${{pCls}}">P${{m.priority || 0}}</span>
+          <span class="kind ${{escapeHtml(m.kind)}}">${{escapeHtml(m.kind)}}</span>
+          <span class="repo">${{escapeHtml(m.repo)}}</span>
+        </div>
+        <div class="title">${{escapeHtml(m.title)}}</div>
+        <div class="rationale ${{long ? 'long' : ''}}">${{escapeHtml(rationale)}}</div>
+        ${{long ? '<button class="show-more" data-id="' + m.id + '">show more</button>' : ''}}
+        <div class="footer">
+          <span class="meta">${{escapeHtml(meta)}}${{
+            m.approved_by ? ' · by ' + escapeHtml(m.approved_by) : ''
+          }}</span>
+          <button class="approve" data-id="${{m.id}}" ${{approveDisabled}}>approve</button>
+          <button class="reject" data-id="${{m.id}}" ${{rejectDisabled}}>reject</button>
+        </div>
+      </div>
+    </div>`;
+}}
+
+async function refresh() {{
+  const status = document.getElementById("status-filter").value;
+  const list = document.getElementById("moves-list");
+  const banner = document.getElementById("err-banner");
+  banner.innerHTML = "";
+  try {{
+    const url = "/cockpit/director/pending.json" + Q
+              + "&status=" + encodeURIComponent(status);
+    const r = await fetch(url, {{cache: "no-store"}});
+    const d = await r.json();
+    if (d.error) {{
+      banner.innerHTML = '<div class="err-banner">' + escapeHtml(d.error) + '</div>';
+      list.innerHTML = '<div class="empty">error</div>';
+      return;
+    }}
+    renderCounts(d.counts);
+    if (!d.moves || !d.moves.length) {{
+      list.innerHTML = '<div class="empty">no ' + escapeHtml(status) + ' moves</div>';
+      return;
+    }}
+    list.innerHTML = d.moves.map(renderMove).join("");
+  }} catch (err) {{
+    banner.innerHTML = '<div class="err-banner">' + escapeHtml(err.message) + '</div>';
+  }}
+}}
+
+async function approveOne(id) {{
+  const r = await fetch("/cockpit/director/approve" + Q, {{
+    method: "POST",
+    headers: {{"content-type": "application/json"}},
+    body: JSON.stringify({{move_id: parseInt(id, 10)}})
+  }});
+  const d = await r.json();
+  if (d.error) alert(d.error);
+  refresh();
+}}
+
+async function rejectOne(id) {{
+  if (!confirm("Reject move #" + id + "?")) return;
+  const r = await fetch("/cockpit/director/reject" + Q, {{
+    method: "POST",
+    headers: {{"content-type": "application/json"}},
+    body: JSON.stringify({{move_id: parseInt(id, 10)}})
+  }});
+  const d = await r.json();
+  if (d.error) alert(d.error);
+  refresh();
+}}
+
+async function approveAllVisible() {{
+  const ids = Array.from(document.querySelectorAll('.move .check'))
+    .map(el => parseInt(el.dataset.id, 10))
+    .filter(Number.isFinite);
+  if (!ids.length) return;
+  if (!confirm("Approve " + ids.length + " moves?")) return;
+  const r = await fetch("/cockpit/director/approve" + Q, {{
+    method: "POST",
+    headers: {{"content-type": "application/json"}},
+    body: JSON.stringify({{move_ids: ids}})
+  }});
+  const d = await r.json();
+  if (d.error) alert(d.error); else alert("approved " + d.approved);
+  refresh();
+}}
+
+document.addEventListener("click", (ev) => {{
+  const t = ev.target;
+  if (!t || !t.dataset || !t.dataset.id) return;
+  if (t.classList.contains("approve")) approveOne(t.dataset.id);
+  else if (t.classList.contains("reject")) rejectOne(t.dataset.id);
+  else if (t.classList.contains("show-more")) {{
+    const move = t.closest(".move");
+    if (move) {{
+      const ra = move.querySelector(".rationale");
+      if (ra) {{
+        ra.classList.toggle("expanded");
+        const expanded = ra.classList.contains("expanded");
+        t.textContent = expanded ? "show less" : "show more";
+      }}
+    }}
+  }}
+}});
+
+document.getElementById("refresh-btn").addEventListener("click", refresh);
+document.getElementById("approve-all-btn").addEventListener("click", approveAllVisible);
+document.getElementById("status-filter").addEventListener("change", refresh);
+
+refresh();
+setInterval(refresh, 15000);
 </script>
 </body></html>"""
