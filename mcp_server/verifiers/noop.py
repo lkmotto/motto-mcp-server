@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import VerifyContext, VerifyResult
+from .types import VerifyContext, VerifyResult
 
 
 async def verify(move: dict[str, Any], ctx: VerifyContext) -> VerifyResult:
