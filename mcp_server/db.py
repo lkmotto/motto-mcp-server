@@ -252,6 +252,130 @@ class Database:
                 agent_name, rid, kind, payload, level,
             )
 
+    # ── Artifact content capture (motto-director output critic) ───────────
+    # Real outputs (PR diffs, draft emails, scripts, comp narratives) land
+    # inline in fleet.artifacts.content JSONB so the director's output_critic
+    # lens can read and judge them. review_status starts at 'pending' and
+    # transitions to 'passed' / 'flagged' / 'blocked' after critique.
+
+    async def record_artifact_content(
+        self,
+        *,
+        agent_name: str,
+        kind: str,
+        name: str | None,
+        body: str,
+        run_id: str | None,
+        intent: str | None,
+        repo: str | None,
+        meta: dict[str, Any] | None,
+        send_blocking: bool,
+    ) -> int:
+        """Insert into fleet.artifacts. body is stored verbatim as text inside
+        the content JSONB so the critic can read it back without a separate
+        fetch step. Truncates to 1MB defensively to keep Neon storage sane.
+        """
+        rid = UUID(run_id) if run_id else None
+        # 1MB cap (Neon JSONB is fine well past this; the cap is to keep a
+        # single bad agent from filling the table). Truncated bodies still
+        # critique usefully — the critic sees a 'truncated' flag in meta.
+        max_bytes = 1_000_000
+        body_str = body or ""
+        truncated = False
+        if len(body_str.encode("utf-8", errors="replace")) > max_bytes:
+            body_str = body_str.encode("utf-8", errors="replace")[:max_bytes].decode(
+                "utf-8", errors="replace"
+            )
+            truncated = True
+        content = {
+            "body": body_str,
+            "intent": intent or "",
+            "repo": repo or "",
+            "meta": meta or {},
+            "truncated": truncated,
+            "review_status": "pending",
+            "send_blocking": bool(send_blocking),
+        }
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                """
+                INSERT INTO fleet.artifacts (run_id, agent_id, kind, name, content)
+                SELECT $2, id, $3, $4, $5
+                FROM fleet.agents WHERE name = $1
+                RETURNING id
+                """,
+                agent_name, rid, kind, name, content,
+            )
+
+    async def artifacts_pending_review(
+        self,
+        *,
+        since_hours: int = 24,
+        limit: int = 25,
+        agent_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Recent artifacts whose content.review_status is still 'pending'.
+
+        Returns newest-first. Director's output_critic lens calls this each
+        tick to find work to review. Filters: window (since_hours), agent.
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT ar.id, ar.run_id, ar.ts, ar.kind, ar.name, ar.content,
+                       a.name AS agent_name
+                FROM fleet.artifacts ar
+                JOIN fleet.agents a ON a.id = ar.agent_id
+                WHERE ar.ts >= now() - make_interval(hours => $1)
+                  AND COALESCE(ar.content->>'review_status', 'pending') = 'pending'
+                  AND ($2::text IS NULL OR a.name = $2)
+                ORDER BY ar.ts DESC
+                LIMIT $3
+                """,
+                int(since_hours), agent_name, int(limit),
+            )
+            return [
+                {
+                    "id": int(r["id"]),
+                    "run_id": str(r["run_id"]) if r["run_id"] else None,
+                    "ts": r["ts"].isoformat(),
+                    "kind": r["kind"],
+                    "name": r["name"],
+                    "agent_name": r["agent_name"],
+                    "content": r["content"] or {},
+                }
+                for r in rows
+            ]
+
+    async def mark_artifact_reviewed(
+        self,
+        *,
+        artifact_id: int,
+        review_status: str,
+        critique: dict[str, Any] | None = None,
+    ) -> bool:
+        """Update content.review_status (+ optional critique payload) on an
+        artifact row. Allowed statuses: 'passed' | 'flagged' | 'blocked'.
+        Uses jsonb || merge so we don't blow away the original body.
+        """
+        if review_status not in ("passed", "flagged", "blocked"):
+            raise ValueError(f"invalid review_status: {review_status}")
+        patch: dict[str, Any] = {"review_status": review_status}
+        if critique is not None:
+            patch["critique"] = critique
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE fleet.artifacts
+                SET content = COALESCE(content, '{}'::jsonb)
+                            || $2::jsonb
+                            || jsonb_build_object('reviewed_at', now()::text)
+                WHERE id = $1
+                """,
+                int(artifact_id), patch,
+            )
+            return result.endswith(" 1")
+
     async def recent_events(
         self,
         *,

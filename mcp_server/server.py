@@ -146,6 +146,78 @@ async def record_event(
 
 
 @mcp.tool
+async def record_artifact_content(
+    agent_name: str,
+    kind: str,
+    body: str,
+    name: str | None = None,
+    run_id: str | None = None,
+    intent: str | None = None,
+    repo: str | None = None,
+    meta: dict[str, Any] | None = None,
+    send_blocking: bool = False,
+) -> dict[str, int]:
+    """Record an actual output artifact (PR diff, draft email, script, comp
+    narrative, etc.) inline in fleet.artifacts.content so the director's
+    output_critic lens can read and judge it.
+
+    - kind: short label, e.g. 'cold_email', 'pr_diff', 'video_script',
+      'comp_narrative', 'amc_reply_draft'.
+    - body: the actual text. Capped at ~1MB; longer bodies are truncated
+      with truncated=true in the stored content.
+    - intent: what the producing agent was trying to do, used by the
+      critic to judge fit-to-intent.
+    - repo: optional source repo (e.g. lkmotto/motto-sdr-agent) so the
+      critic knows where to file a critique issue.
+    - send_blocking: if true, downstream code MUST check review_status
+      before dispatching (e.g. SDR cold-send, AMC email-send).
+    """
+    artifact_id = await db.record_artifact_content(
+        agent_name=agent_name,
+        kind=kind,
+        name=name,
+        body=body,
+        run_id=run_id,
+        intent=intent,
+        repo=repo,
+        meta=meta,
+        send_blocking=send_blocking,
+    )
+    return {"artifact_id": int(artifact_id)}
+
+
+@mcp.tool
+async def artifacts_pending_review(
+    since_hours: int = 24,
+    limit: int = 25,
+    agent_name: str | None = None,
+) -> list[dict[str, Any]]:
+    """Recent artifacts not yet critiqued. Director's output_critic lens."""
+    return await db.artifacts_pending_review(
+        since_hours=since_hours,
+        limit=limit,
+        agent_name=agent_name,
+    )
+
+
+@mcp.tool
+async def mark_artifact_reviewed(
+    artifact_id: int,
+    review_status: str,
+    critique: dict[str, Any] | None = None,
+) -> dict[str, bool]:
+    """Set content.review_status to 'passed' | 'flagged' | 'blocked'
+    after critique. Optional critique payload (issues[], severity, etc).
+    """
+    ok = await db.mark_artifact_reviewed(
+        artifact_id=artifact_id,
+        review_status=review_status,
+        critique=critique,
+    )
+    return {"ok": bool(ok)}
+
+
+@mcp.tool
 async def signal_intent(
     target_agent: str,
     kind: str,
