@@ -3,12 +3,28 @@
 Routes:
     /cockpit                    Single-page UI (HTML)
     /cockpit/state.json         Live state for polling (auth)
-    /cockpit/chat               POST: chat with director (Claude Max OAuth)
+    /cockpit/chat               POST: chat with director (DeepSeek V4-Flash)
     /cockpit/intent             POST: submit a manual intent / nudge
 
-The chat endpoint uses CLAUDE_CODE_OAUTH_TOKEN (the user's $200/mo Claude
-Max subscription). The server-side prompt context includes live fleet
-state so the director can answer questions and propose actions.
+The chat endpoint uses DeepSeek's OpenAI-compatible API (key:
+DEEPSEEK_API_KEY in motto-core-prd). The server-side prompt context
+includes live fleet state so the director can answer questions and
+propose actions.
+
+Provider history (May 2026):
+  - Originally Anthropic /v1/messages via API key.
+  - 2026-01-09: switched to Claude Max OAuth (anthropics blocked direct
+    OAuth POSTs to /v1/messages).
+  - 2026-04: shimmed via Claude Code CLI subprocess (`claude -p`) when
+    OAuth-on-/v1/messages was killed for good.
+  - 2026-05-05: cancelled Claude Max sub. The CLI subprocess shim
+    timed out at 120s under load and the underlying account hit
+    "Credit balance too low" because ANTHROPIC_API_KEY env precedence
+    wins over CLAUDE_CODE_OAUTH_TOKEN in non-interactive `-p` mode
+    (anthropics/claude-code#5300).
+  - 2026-05-05: migrated to DeepSeek V4-Flash. Single-provider,
+    OpenAI-compatible, $0.14/$0.28 per M tokens, 1M context. Mirrors
+    motto-director's deepseek-only chain (motto-director PR #36).
 
 Submitting an intent inserts into fleet.intents with source='cockpit-user',
 so motto-director will pick it up on the next consume_open_intents call.
@@ -20,7 +36,6 @@ import asyncio
 import json
 import logging
 import os
-import shutil
 from datetime import datetime, timezone
 from html import escape as h
 from typing import Any
@@ -132,55 +147,44 @@ async def _build_fleet_context(db: Database) -> str:
     return "".join(parts)
 
 
-async def call_claude_max(
+DEEPSEEK_BASE_URL = os.environ.get(
+    "DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"
+)
+DEEPSEEK_DEFAULT_MODEL = os.environ.get(
+    "DEEPSEEK_MODEL", "deepseek-v4-flash"
+)
+DEEPSEEK_TIMEOUT_S = float(os.environ.get("DEEPSEEK_TIMEOUT_S", "120"))
+
+
+async def call_deepseek(
     system: str,
     messages: list[dict[str, str]],
-    model: str = "claude-sonnet-4-5",
-    max_tokens: int = 1024,  # accepted for API parity; not passed to CLI
+    model: str | None = None,
+    max_tokens: int = 1024,
 ) -> dict[str, Any]:
-    """Run the Claude Code CLI as a subprocess.
+    """Call DeepSeek's OpenAI-compatible chat completions API.
 
-    Anthropic blocked direct OAuth POSTs to /v1/messages on 2026-01-09; the
-    supported integration path for Claude Max-billed inference is the
-    Claude Code CLI. This shim runs:
+    DEEPSEEK_API_KEY must be set in the process env (lives in motto-core-prd
+    as of 2026-05-05; mirrored from the user's repo-level DEEPSEEK_API
+    secret via .github/workflows/sync-deepseek-secret.yml in motto-director).
 
-        claude -p <user> --output-format json --max-turns 1 \
-               --model <model> --append-system-prompt <system>
+    `messages` is the conversation history. The system prompt is prepended
+    as a `system` role message.
 
-    Critical: --append-system-prompt (NOT --system-prompt). The latter
-    strips Claude Code's identity prefix and silently bills the API
-    instead of Claude Max.
-
-    CLAUDE_CODE_OAUTH_TOKEN must be set in the process env; the CLI
-    picks it up automatically.
-
-    `messages` is collapsed into a single transcript on the user side
-    of the prompt because --max-turns 1 is non-interactive. We keep
-    the full chat history visible to the model so it can answer
-    follow-ups in context.
-
-    Returns a dict shaped like the old /v1/messages response so callers
-    (and `_extract_text`) don't need to change:
+    Returns a dict in the same shape the previous Claude-Max-CLI shim
+    returned, so `_extract_text` and the /cockpit/chat handler don't need
+    to change:
         success  -> {type: "message", content: [{type: "text", text: ...}],
                      model, usage, ...}
         error    -> {error: "...", type: "config_error"|"upstream_error"|...}
     """
-    token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-    if not token:
+    api_key = os.environ.get("DEEPSEEK_API_KEY")
+    if not api_key:
         return {
-            "error": "CLAUDE_CODE_OAUTH_TOKEN not set on server",
+            "error": "DEEPSEEK_API_KEY not set on server",
             "type": "config_error",
         }
 
-    cli_bin = os.environ.get("CLAUDE_CLI_BIN", "claude")
-    if shutil.which(cli_bin) is None:
-        return {
-            "error": f"`{cli_bin}` CLI not on PATH inside the container",
-            "type": "config_error",
-        }
-
-    # Collapse the history into a transcript. The last user turn is the
-    # actual question; earlier turns become context above it.
     if not messages:
         return {"error": "no messages", "type": "config_error"}
 
@@ -191,124 +195,84 @@ async def call_claude_max(
             "type": "config_error",
         }
 
-    transcript_lines: list[str] = []
-    for m in messages[:-1]:
-        role = m.get("role", "user").upper()
-        content = m.get("content", "")
-        transcript_lines.append(f"[{role}]\n{content}")
-    if transcript_lines:
-        user_prompt = (
-            "# Prior conversation\n"
-            + "\n\n".join(transcript_lines)
-            + "\n\n# Current message\n"
-            + last.get("content", "")
-        )
-    else:
-        user_prompt = last.get("content", "")
+    chosen_model = model or DEEPSEEK_DEFAULT_MODEL
 
-    # We deliberately do NOT prepend CLAUDE_CODE_SYSTEM_PREFIX here — the
-    # CLI already starts every conversation with its Claude Code identity
-    # prompt, and --append-system-prompt adds ours after it.
-    cmd = [
-        cli_bin,
-        "-p", user_prompt,
-        "--output-format", "json",
-        "--max-turns", "1",
-        "--model", model,
-        "--append-system-prompt", system,
-        # Northflank containers run as root. The Claude Code CLI refuses to
-        # operate non-interactively under root unless this flag is set
-        # (see anthropics/claude-code#3490, #2951, #9184). Safe under
-        # `--max-turns 1` because no tool calls happen.
-        "--dangerously-skip-permissions",
+    # OpenAI-compatible chat completions: prepend system as a role-message
+    # rather than relying on a separate system parameter (DeepSeek accepts
+    # both but role-message is more portable).
+    payload_messages: list[dict[str, str]] = [
+        {"role": "system", "content": system}
     ]
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content", "") or ""
+        if role in ("user", "assistant") and content:
+            payload_messages.append({"role": role, "content": content})
 
-    timeout_s = float(os.environ.get("CLAUDE_MAX_TIMEOUT_S", "120"))
+    body = {
+        "model": chosen_model,
+        "messages": payload_messages,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+
+    url = f"{DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "CLAUDE_CODE_OAUTH_TOKEN": token, "IS_SANDBOX": "1"},
-            # stdin pinned to DEVNULL: the Claude Code CLI inspects stdin
-            # even when `-p <text>` provides the prompt and pauses ~3s on a
-            # connected pipe. In a Northflank container the inherited stdin
-            # is a closed/orphan TTY, which produces:
-            #   "no stdin data received in 3s, proceeding without it"
-            # followed by exit=1. Pinning to DEVNULL is the documented fix.
-            # (Reproduced in motto-director run 3dd3a015 on 2026-05-05.)
-        )
-        try:
-            stdout_b, stderr_b = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout_s
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            return {
-                "error": f"claude CLI timed out after {timeout_s}s",
-                "type": "timeout_error",
-            }
-    except FileNotFoundError as exc:
-        return {"error": str(exc), "type": "config_error"}
-    except Exception as e:  # pragma: no cover
-        logger.exception("claude_max subprocess launch failed")
-        return {"error": str(e), "type": "transport_error"}
-
-    if proc.returncode != 0:
-        stderr_s = (stderr_b or b"").decode("utf-8", "replace")[:1000]
+        async with httpx.AsyncClient(timeout=DEEPSEEK_TIMEOUT_S) as client:
+            resp = await client.post(url, headers=headers, json=body)
+    except httpx.TimeoutException:
         return {
-            "error": f"claude CLI exited {proc.returncode}",
-            "type": "upstream_error",
-            "status_code": 502,
-            "detail": stderr_s,
+            "error": f"deepseek API timed out after {DEEPSEEK_TIMEOUT_S}s",
+            "type": "timeout_error",
         }
+    except httpx.HTTPError as exc:  # pragma: no cover
+        logger.exception("deepseek transport error")
+        return {"error": str(exc), "type": "transport_error"}
 
-    stdout_s = (stdout_b or b"").decode("utf-8", "replace").strip()
-    if not stdout_s:
+    if resp.status_code >= 400:
+        # Surface the status + body so the caller can render a useful error.
+        detail = resp.text[:1000] if resp.text else ""
         return {
-            "error": "claude CLI returned empty stdout",
+            "error": f"deepseek HTTP {resp.status_code}",
             "type": "upstream_error",
-            "status_code": 502,
+            "status_code": resp.status_code,
+            "detail": detail,
         }
 
     try:
-        envelope = json.loads(stdout_s)
+        envelope = resp.json()
     except json.JSONDecodeError as exc:
         return {
-            "error": f"could not parse claude CLI JSON: {exc}",
+            "error": f"could not parse deepseek JSON: {exc}",
             "type": "upstream_error",
             "status_code": 502,
-            "detail": stdout_s[:500],
+            "detail": resp.text[:500],
         }
 
-    # The CLI envelope is shaped like:
-    #   {"type":"result","subtype":"success","result":"<text>",
-    #    "session_id":"...","usage":{...},"total_cost_usd":...,"model":"..."}
-    if isinstance(envelope, dict) and envelope.get("subtype") == "success":
-        text = envelope.get("result") or ""
+    # OpenAI-compatible envelope:
+    #   {"id":..., "choices":[{"message":{"role":"assistant","content":...}, ...}],
+    #    "usage":{"prompt_tokens":..., "completion_tokens":..., "total_tokens":...},
+    #    "model":...}
+    choices = envelope.get("choices") or []
+    if not choices:
         return {
-            "type": "message",
-            "content": [{"type": "text", "text": text}],
-            "model": envelope.get("model") or model,
-            "usage": envelope.get("usage") or {},
-            "session_id": envelope.get("session_id"),
-            "total_cost_usd": envelope.get("total_cost_usd"),
+            "error": "deepseek returned no choices",
+            "type": "upstream_error",
+            "status_code": 502,
+            "detail": envelope,
         }
-
-    # Some envelopes use "is_error" or surface the failure differently.
-    err_msg = (
-        envelope.get("error")
-        if isinstance(envelope, dict)
-        else None
-    ) or stdout_s[:300]
+    text = (choices[0].get("message") or {}).get("content") or ""
     return {
-        "error": f"claude CLI returned non-success: {err_msg}",
-        "type": "upstream_error",
-        "status_code": 502,
-        "detail": envelope,
+        "type": "message",
+        "content": [{"type": "text", "text": text}],
+        "model": envelope.get("model") or chosen_model,
+        "usage": envelope.get("usage") or {},
+        "id": envelope.get("id"),
     }
 
 
@@ -384,7 +348,7 @@ def register_routes(mcp, db: Database) -> None:
 
         fleet_ctx = await _build_fleet_context(db)
         system = DIRECTOR_PERSONA + "\n" + fleet_ctx
-        resp = await call_claude_max(
+        resp = await call_deepseek(
             system=system,
             messages=clean,
             max_tokens=int(body.get("max_tokens") or 1024),
@@ -765,7 +729,7 @@ def _render_cockpit(token: str) -> str:
     <!-- Left: chat -->
     <div class="col">
       <div class="panel" style="flex:1">
-        <h2>director chat <span style="font-weight:400;font-size:11px">claude max · sonnet 4.5</span></h2>
+        <h2>director chat <span style="font-weight:400;font-size:11px">deepseek · v4-flash</span></h2>
         <div id="chat-log"></div>
         <form id="chat-form">
           <textarea id="chat-input" placeholder="ask the director… (enter to send, shift+enter for newline)"></textarea>

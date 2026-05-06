@@ -65,7 +65,8 @@ def set_pool(pool: asyncpg.Pool | None) -> None:
 
 def _require_db() -> None:
     """Raise early if DATABASE_URL is absent (no pool yet, no env var)."""
-    if "p" not in _pool_holder and not (os.environ.get("DATABASE_URL") or os.environ.get("NEON_DATABASE_URL")):
+    has_url = os.environ.get("DATABASE_URL") or os.environ.get("NEON_DATABASE_URL")
+    if "p" not in _pool_holder and not has_url:
         raise RuntimeError(
             "DATABASE_URL is not configured. "
             "Set it via Doppler (motto-core/prd). "
