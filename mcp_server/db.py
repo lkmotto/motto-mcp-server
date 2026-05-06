@@ -995,3 +995,469 @@ class Database:
                 return int(result.split()[-1])
             except (ValueError, IndexError):
                 return 0
+
+    # ── Director epics ───────────────────────────────────────────────────
+    # epics table is owned by motto-director migrations (0006_epics.sql).
+    # Cockpit reads/writes the same rows so a human can approve, pause, or
+    # abandon a multi-cycle plan before director keeps spending on it.
+
+    async def director_epics(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List epics, optionally filtered by status. status='all' or None
+        returns every status. Includes a count of related pending_moves
+        keyed by epic_id (via run_id match) so the UI can show progress."""
+        async with self.pool.acquire() as conn:
+            if status and status != "all":
+                rows = await conn.fetch(
+                    """
+                    SELECT id, run_id, title, kpi_ref, rationale,
+                           estimated_cycles, success_criteria, plan,
+                           status, approved_by, approved_at,
+                           closed_at, closed_reason,
+                           created_at, updated_at
+                    FROM public.epics
+                    WHERE status = $1
+                    ORDER BY created_at DESC
+                    LIMIT $2
+                    """,
+                    status,
+                    int(limit),
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, run_id, title, kpi_ref, rationale,
+                           estimated_cycles, success_criteria, plan,
+                           status, approved_by, approved_at,
+                           closed_at, closed_reason,
+                           created_at, updated_at
+                    FROM public.epics
+                    ORDER BY created_at DESC
+                    LIMIT $1
+                    """,
+                    int(limit),
+                )
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                d = dict(r)
+                # Plan is stored as jsonb — asyncpg gives back a dict already,
+                # but if it's a str (older rows), parse it.
+                plan = d.get("plan")
+                if isinstance(plan, str):
+                    try:
+                        d["plan"] = json.loads(plan)
+                    except (ValueError, TypeError):
+                        d["plan"] = []
+                # ISO-ize timestamps
+                for k in (
+                    "created_at", "updated_at",
+                    "approved_at", "closed_at",
+                ):
+                    v = d.get(k)
+                    if v is not None:
+                        d[k] = v.isoformat()
+                out.append(d)
+            return out
+
+    async def director_epic_counts(self) -> dict[str, int]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT status, count(*)::int AS n
+                FROM public.epics
+                GROUP BY status
+                """
+            )
+            return {r["status"]: r["n"] for r in rows}
+
+    async def director_set_epic_status(
+        self,
+        *,
+        epic_id: int,
+        new_status: str,
+        approved_by: str,
+        closed_reason: str = "",
+    ) -> bool:
+        """Transition an epic to a new status. Allowed:
+          proposed -> active | abandoned
+          active   -> paused | closed | abandoned
+          paused   -> active | abandoned
+        """
+        allowed = {"proposed", "active", "paused", "closed", "abandoned"}
+        if new_status not in allowed:
+            return False
+        async with self.pool.acquire() as conn:
+            if new_status in ("closed", "abandoned"):
+                result = await conn.execute(
+                    """
+                    UPDATE public.epics
+                    SET status = $2,
+                        approved_by = COALESCE(approved_by, $3),
+                        closed_at = NOW(),
+                        closed_reason = $4,
+                        updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    int(epic_id), new_status, approved_by, closed_reason,
+                )
+            elif new_status == "active":
+                result = await conn.execute(
+                    """
+                    UPDATE public.epics
+                    SET status = 'active',
+                        approved_by = $2,
+                        approved_at = COALESCE(approved_at, NOW()),
+                        updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    int(epic_id), approved_by,
+                )
+            else:  # paused or proposed
+                result = await conn.execute(
+                    """
+                    UPDATE public.epics
+                    SET status = $2, updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    int(epic_id), new_status,
+                )
+            return result.endswith(" 1")
+
+    # ── Planner observability ────────────────────────────────────────────
+
+    async def latest_planner_event(self) -> dict[str, Any] | None:
+        """Return the most recent fleet.events row of kind='planner.cycle',
+        used by the cockpit to show what DeepSeek's planner most recently
+        produced (parsed/inserted/output preview/finish_reason/tokens)."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, ts, agent_id, kind, run_id, payload
+                FROM fleet.events
+                WHERE kind = 'planner.cycle'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            )
+            if not row:
+                return None
+            d = dict(row)
+            v = d.get("ts")
+            if v is not None:
+                d["ts"] = v.isoformat()
+            payload = d.get("payload")
+            if isinstance(payload, str):
+                try:
+                    d["payload"] = json.loads(payload)
+                except (ValueError, TypeError):
+                    d["payload"] = {}
+            return d
+
+    # ── Verify_move framework ────────────────────────────────────────────
+    # Tables owned by 0005_verify_and_capabilities.sql. Three concerns:
+    #   - move_verifications  : outcomes of verifier runs
+    #   - capability_requests : director-asks-human for resources
+    #   - trust_scores        : rolling per-scope confidence
+
+    async def fetch_pending_move(self, move_id: int) -> dict[str, Any] | None:
+        """Read a single pending_moves row by id. The table lives in `public`
+        and is owned by motto-director migrations; we just read it."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, run_id, created_at, updated_at, repo, kind, title,
+                       rationale, intent, priority, move_payload, status,
+                       approved_by, approved_at, applied_at, apply_detail
+                FROM public.pending_moves
+                WHERE id = $1
+                """,
+                int(move_id),
+            )
+            if not row:
+                return None
+            d = dict(row)
+            for k in ("created_at", "updated_at", "approved_at", "applied_at"):
+                v = d.get(k)
+                if v is not None:
+                    d[k] = v.isoformat()
+            mp = d.get("move_payload")
+            if isinstance(mp, str):
+                try:
+                    d["move_payload"] = json.loads(mp)
+                except (ValueError, TypeError):
+                    d["move_payload"] = {}
+            return d
+
+    async def record_verification(
+        self,
+        *,
+        move_id: int,
+        repo: str,
+        kind: str,
+        verifier: str,
+        status: str,
+        evidence: dict[str, Any] | None = None,
+        kpi_delta: dict[str, Any] | None = None,
+        error: str | None = None,
+        duration_ms: int | None = None,
+        requested_by: str | None = None,
+    ) -> dict[str, Any]:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO fleet.move_verifications
+                    (move_id, repo, kind, verifier, status, evidence,
+                     kpi_delta, error, completed_at, duration_ms, requested_by)
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, NOW(), $9, $10)
+                RETURNING id, started_at, completed_at
+                """,
+                int(move_id), repo, kind, verifier, status,
+                json.dumps(evidence or {}),
+                json.dumps(kpi_delta or {}),
+                error, duration_ms, requested_by,
+            )
+            d = dict(row)
+            for k in ("started_at", "completed_at"):
+                v = d.get(k)
+                if v is not None:
+                    d[k] = v.isoformat()
+            return d
+
+    async def list_verifications(
+        self,
+        *,
+        move_id: int | None = None,
+        repo: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        i = 1
+        if move_id is not None:
+            clauses.append(f"move_id = ${i}"); params.append(int(move_id)); i += 1
+        if repo:
+            clauses.append(f"repo = ${i}"); params.append(repo); i += 1
+        if status:
+            clauses.append(f"status = ${i}"); params.append(status); i += 1
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = (
+            "SELECT id, move_id, repo, kind, verifier, status, evidence,"
+            " kpi_delta, error, started_at, completed_at, duration_ms,"
+            " requested_by FROM fleet.move_verifications"
+            f"{where} ORDER BY id DESC LIMIT ${i}"
+        )
+        params.append(int(limit))
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                d = dict(r)
+                for k in ("started_at", "completed_at"):
+                    v = d.get(k)
+                    if v is not None:
+                        d[k] = v.isoformat()
+                for k in ("evidence", "kpi_delta"):
+                    v = d.get(k)
+                    if isinstance(v, str):
+                        try:
+                            d[k] = json.loads(v)
+                        except (ValueError, TypeError):
+                            d[k] = {}
+                out.append(d)
+            return out
+
+    # ── Capability requests ──────────────────────────────────────────────
+
+    async def file_capability_request(
+        self,
+        *,
+        capability: str,
+        justification: str,
+        requested_by: str,
+        repo: str | None = None,
+        move_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Idempotent on (capability, status='pending'): if a pending
+        request for this capability already exists, return it instead
+        of opening a duplicate."""
+        async with self.pool.acquire() as conn:
+            existing = await conn.fetchrow(
+                """
+                SELECT id, capability, repo, move_id, justification,
+                       status, requested_by, requested_at
+                FROM fleet.capability_requests
+                WHERE capability = $1 AND status = 'pending'
+                ORDER BY id DESC LIMIT 1
+                """,
+                capability,
+            )
+            if existing:
+                d = dict(existing)
+                v = d.get("requested_at")
+                if v is not None:
+                    d["requested_at"] = v.isoformat()
+                d["already_pending"] = True
+                return d
+            row = await conn.fetchrow(
+                """
+                INSERT INTO fleet.capability_requests
+                    (capability, repo, move_id, justification, requested_by)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id, capability, repo, move_id, justification,
+                          status, requested_by, requested_at
+                """,
+                capability, repo, move_id, justification, requested_by,
+            )
+            d = dict(row)
+            v = d.get("requested_at")
+            if v is not None:
+                d["requested_at"] = v.isoformat()
+            d["already_pending"] = False
+            return d
+
+    async def list_capability_requests(
+        self, *, status: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        async with self.pool.acquire() as conn:
+            if status and status != "all":
+                rows = await conn.fetch(
+                    """
+                    SELECT id, capability, repo, move_id, justification,
+                           status, requested_by, requested_at,
+                           decided_by, decided_at, grant_detail, deny_reason
+                    FROM fleet.capability_requests
+                    WHERE status = $1
+                    ORDER BY requested_at DESC LIMIT $2
+                    """,
+                    status, int(limit),
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, capability, repo, move_id, justification,
+                           status, requested_by, requested_at,
+                           decided_by, decided_at, grant_detail, deny_reason
+                    FROM fleet.capability_requests
+                    ORDER BY requested_at DESC LIMIT $1
+                    """,
+                    int(limit),
+                )
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                d = dict(r)
+                for k in ("requested_at", "decided_at"):
+                    v = d.get(k)
+                    if v is not None:
+                        d[k] = v.isoformat()
+                out.append(d)
+            return out
+
+    async def decide_capability_request(
+        self,
+        *,
+        request_id: int,
+        decision: str,         # 'granted' | 'denied'
+        decided_by: str,
+        grant_detail: str | None = None,
+        deny_reason: str | None = None,
+    ) -> bool:
+        if decision not in ("granted", "denied"):
+            return False
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE fleet.capability_requests
+                SET status = $2, decided_by = $3, decided_at = NOW(),
+                    grant_detail = $4, deny_reason = $5
+                WHERE id = $1 AND status = 'pending'
+                """,
+                int(request_id), decision, decided_by,
+                grant_detail, deny_reason,
+            )
+            return result.endswith("UPDATE 1")
+
+    # ── Trust scores ─────────────────────────────────────────────────────
+
+    async def update_trust_score(
+        self, *, scope: str, passed: bool, alpha: float = 0.2
+    ) -> dict[str, Any]:
+        """EWMA-style update: new = (1-α)*old + α*sample. sample=1 if passed,
+        else 0. First sample on a brand-new scope starts at 0.5 prior."""
+        sample = 1.0 if passed else 0.0
+        async with self.pool.acquire() as conn:
+            existing = await conn.fetchrow(
+                "SELECT score, sample_size FROM fleet.trust_scores WHERE scope = $1",
+                scope,
+            )
+            if existing:
+                old = float(existing["score"])
+                new = (1.0 - alpha) * old + alpha * sample
+                row = await conn.fetchrow(
+                    """
+                    UPDATE fleet.trust_scores
+                    SET score = $2, sample_size = sample_size + 1,
+                        last_passed_at = CASE WHEN $3 THEN NOW() ELSE last_passed_at END,
+                        last_failed_at = CASE WHEN NOT $3 THEN NOW() ELSE last_failed_at END,
+                        updated_at = NOW()
+                    WHERE scope = $1
+                    RETURNING scope, score, sample_size,
+                              last_passed_at, last_failed_at, updated_at
+                    """,
+                    scope, new, passed,
+                )
+            else:
+                # First sample — blend 0.5 prior with the observation.
+                new = 0.5 * 0.5 + 0.5 * sample
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO fleet.trust_scores
+                        (scope, score, sample_size,
+                         last_passed_at, last_failed_at)
+                    VALUES (
+                        $1, $2, 1,
+                        CASE WHEN $3 THEN NOW() ELSE NULL END,
+                        CASE WHEN NOT $3 THEN NOW() ELSE NULL END
+                    )
+                    RETURNING scope, score, sample_size,
+                              last_passed_at, last_failed_at, updated_at
+                    """,
+                    scope, new, passed,
+                )
+            d = dict(row)
+            for k in ("last_passed_at", "last_failed_at", "updated_at"):
+                v = d.get(k)
+                if v is not None:
+                    d[k] = v.isoformat()
+            return d
+
+    async def get_trust_scores(
+        self, *, scope: str | None = None
+    ) -> list[dict[str, Any]]:
+        async with self.pool.acquire() as conn:
+            if scope:
+                rows = await conn.fetch(
+                    "SELECT scope, score, sample_size, last_passed_at,"
+                    " last_failed_at, updated_at FROM fleet.trust_scores"
+                    " WHERE scope = $1",
+                    scope,
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT scope, score, sample_size, last_passed_at,"
+                    " last_failed_at, updated_at FROM fleet.trust_scores"
+                    " ORDER BY scope"
+                )
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                d = dict(r)
+                for k in ("last_passed_at", "last_failed_at", "updated_at"):
+                    v = d.get(k)
+                    if v is not None:
+                        d[k] = v.isoformat()
+                out.append(d)
+            return out

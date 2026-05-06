@@ -393,6 +393,171 @@ async def list_local_tasks(
     return await db.list_local_tasks(status=status, kind=kind, limit=limit)
 
 
+# ── Verify_move framework (May 2026) ──────────────────────────────────────────────────────────
+# Closes the propose → approve → apply → ??? loop. After a move is applied,
+# director (or the cockpit) calls verify_move(move_id) and the dispatcher
+# in mcp_server.verifiers picks the right verifier for the move's kind.
+# Verifiers may need resources (API keys, OAuth tokens) they don't have —
+# they file capability_requests that a human grants in the cockpit.
+#
+# Day 1 ships only `noop` (auto-pass) and `merge_pr` (gh CI check). Real
+# per-repo verifiers come reactively when director files a capability
+# request and a human approves it.
+
+
+import time
+import httpx
+from .verifiers import VerifyContext, dispatch as _dispatch_verifier
+
+
+@mcp.tool
+async def verify_move(
+    move_id: int,
+    requested_by: str = "director",
+) -> dict[str, Any]:
+    """Run the appropriate verifier for an applied pending_moves row and
+    record the outcome. Returns the verification record (status,
+    evidence, kpi_delta, error). Idempotent only by timestamp — calling
+    twice produces two rows; the cockpit / trust score logic should
+    look at the most recent row."""
+    move = await db.fetch_pending_move(int(move_id))
+    if not move:
+        return {"ok": False, "error": f"move {move_id} not found"}
+    repo = move.get("repo") or ""
+    kind = move.get("kind") or ""
+
+    started = time.time()
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        async def _http_get(url: str, **kw: Any) -> Any:
+            return await client.get(url, **kw)
+
+        async def _http_post(url: str, **kw: Any) -> Any:
+            return await client.post(url, **kw)
+
+        async def _request_capability(
+            capability: str, justification: str, repo_arg: str | None = None
+        ) -> int:
+            row = await db.file_capability_request(
+                capability=capability,
+                justification=justification,
+                requested_by=requested_by,
+                repo=repo_arg or repo or None,
+                move_id=int(move_id),
+            )
+            return int(row["id"])
+
+        ctx = VerifyContext(
+            db=db,
+            http_get=_http_get,
+            http_post=_http_post,
+            request_capability=_request_capability,
+            requested_by=requested_by,
+        )
+        result = await _dispatch_verifier(move, ctx)
+
+    duration_ms = int((time.time() - started) * 1000)
+    rec = await db.record_verification(
+        move_id=int(move_id),
+        repo=repo,
+        kind=kind,
+        verifier=result.verifier,
+        status=result.status,
+        evidence=result.evidence,
+        kpi_delta=result.kpi_delta,
+        error=result.error,
+        duration_ms=duration_ms,
+        requested_by=requested_by,
+    )
+
+    # Trust score nudges only on definitive outcomes.
+    if result.status in ("passed", "failed"):
+        passed = result.status == "passed"
+        await db.update_trust_score(scope="global", passed=passed)
+        if repo:
+            await db.update_trust_score(scope=repo, passed=passed)
+
+    rec["status"] = result.status
+    rec["verifier"] = result.verifier
+    rec["evidence"] = result.evidence
+    rec["kpi_delta"] = result.kpi_delta
+    rec["error"] = result.error
+    rec["ok"] = True
+    return rec
+
+
+@mcp.tool
+async def list_verifications(
+    move_id: int | None = None,
+    repo: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """List recent move verifications, newest first. Filter by move_id,
+    repo, or status (passed/failed/inconclusive/error)."""
+    return await db.list_verifications(
+        move_id=move_id, repo=repo, status=status, limit=limit
+    )
+
+
+@mcp.tool
+async def request_capability(
+    capability: str,
+    justification: str,
+    requested_by: str = "director",
+    repo: str | None = None,
+    move_id: int | None = None,
+) -> dict[str, Any]:
+    """Director (or any agent) files a request for a connector / API key /
+    OAuth scope it needs to perform a verification or move. Idempotent on
+    capability+pending: a duplicate request returns the existing pending
+    row instead of opening a new one. The cockpit grants or denies."""
+    return await db.file_capability_request(
+        capability=capability,
+        justification=justification,
+        requested_by=requested_by,
+        repo=repo,
+        move_id=move_id,
+    )
+
+
+@mcp.tool
+async def list_capability_requests(
+    status: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """List capability requests, newest first. status='pending' shows the
+    queue waiting for human grant."""
+    return await db.list_capability_requests(status=status, limit=limit)
+
+
+@mcp.tool
+async def decide_capability_request(
+    request_id: int,
+    decision: str,
+    decided_by: str,
+    grant_detail: str | None = None,
+    deny_reason: str | None = None,
+) -> dict[str, bool]:
+    """Grant or deny a capability request. decision='granted' should also
+    include grant_detail describing how it was satisfied (e.g. 'env:
+    POSTMARK_API_KEY set in motto-mcp-server'). Cockpit calls this."""
+    ok = await db.decide_capability_request(
+        request_id=request_id,
+        decision=decision,
+        decided_by=decided_by,
+        grant_detail=grant_detail,
+        deny_reason=deny_reason,
+    )
+    return {"ok": ok}
+
+
+@mcp.tool
+async def get_trust_scores(scope: str | None = None) -> list[dict[str, Any]]:
+    """Return rolling trust scores per scope (global + each repo). EWMA
+    over verify.passed / verify.failed events."""
+    return await db.get_trust_scores(scope=scope)
+
+
 # ── HTTP custom routes (dashboard + status JSON + healthz) ─────────────────────────────────────
 
 
