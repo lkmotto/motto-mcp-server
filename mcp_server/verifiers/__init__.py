@@ -18,29 +18,15 @@ response to capability_requests director files when it actually needs them.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
+
+# Re-export for backwards compatibility — verifier modules now import
+# directly from `.types`, but external callers may still do
+# `from mcp_server.verifiers import VerifyContext, VerifyResult`.
+from .types import VerifyContext, VerifyResult
 
 from . import noop as _noop
 from . import merge_pr as _merge_pr
-
-
-@dataclass
-class VerifyResult:
-    status: str  # passed | failed | inconclusive | error
-    verifier: str
-    evidence: dict[str, Any] = field(default_factory=dict)
-    kpi_delta: dict[str, Any] = field(default_factory=dict)
-    error: str | None = None
-
-
-@dataclass
-class VerifyContext:
-    db: Any                               # mcp_server.db.Database
-    http_get: Callable[..., Awaitable[Any]]
-    http_post: Callable[..., Awaitable[Any]]
-    request_capability: Callable[[str, str, str | None], Awaitable[int]]
-    requested_by: str = "director"
 
 
 # kind -> verifier callable

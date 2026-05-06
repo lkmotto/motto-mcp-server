@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from . import VerifyContext, VerifyResult
+from .types import VerifyContext, VerifyResult
 
 
 _GITHUB_API = "https://api.github.com"
