@@ -224,13 +224,20 @@ async def call_deepseek(
             continue
         if role == "assistant":
             # Assistant turn — may carry tool_calls; preserve them so the
-            # model sees its prior decisions.
-            assistant_msg: dict[str, Any] = {
-                "role": "assistant",
-                "content": m.get("content") or "",
-            }
-            if m.get("tool_calls"):
-                assistant_msg["tool_calls"] = m["tool_calls"]
+            # model sees its prior decisions. OpenAI/DeepSeek strict mode
+            # requires content=null when tool_calls is set; '' is rejected.
+            tcs = m.get("tool_calls")
+            if tcs:
+                assistant_msg: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": m.get("content") or None,
+                    "tool_calls": tcs,
+                }
+            else:
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": m.get("content") or "",
+                }
             payload_messages.append(assistant_msg)
             continue
         if role == "user":
@@ -425,12 +432,19 @@ def register_routes(mcp, db: Database) -> None:
             )
             last_resp = resp
             if resp.get("error"):
+                logger.warning(
+                    "chat deepseek error hop=%d err=%s detail=%s",
+                    hop,
+                    resp.get("error"),
+                    str(resp.get("detail"))[:500],
+                )
                 return JSONResponse(
                     {
                         "reply": _extract_text(resp),
                         "tool_calls": tool_log,
                         "hops": hop,
                         "error": resp.get("error"),
+                        "detail": resp.get("detail"),
                         "model": resp.get("model"),
                         "usage": resp.get("usage"),
                     }
