@@ -656,6 +656,59 @@ def _render_cockpit(token: str) -> str:
     @media (max-width: 1000px) {{
       .layout {{ grid-template-columns: 1fr; height: auto; }}
     }}
+    /* mobile: <=640px */
+    @media (max-width: 640px) {{
+      body {{ font-size: 15px; }}
+      .top {{
+        flex-wrap: wrap; gap: 4px; padding: 8px 12px;
+      }}
+      .top h1 {{ font-size: 15px; }}
+      .top .meta {{ font-size: 11px; flex-basis: 100%; }}
+      .layout {{
+        padding: 8px; gap: 8px;
+      }}
+      .col {{ gap: 8px; }}
+      .panel h2 {{
+        padding: 8px 12px; font-size: 12px;
+        flex-wrap: wrap; gap: 4px;
+      }}
+      .panel .body {{ padding: 10px 12px; }}
+      /* chat fills viewport on mobile */
+      .col:first-child .panel {{
+        min-height: 60vh;
+      }}
+      #chat-log {{ padding: 10px 12px; }}
+      .msg {{ max-width: 92%; font-size: 14px; }}
+      #chat-form {{
+        flex-direction: column; gap: 6px; padding: 8px;
+      }}
+      #chat-input {{
+        font-size: 16px; /* prevents iOS zoom-on-focus */
+        min-height: 44px;
+      }}
+      #chat-form button {{ width: 100%; padding: 10px 14px; font-size: 14px; }}
+      /* intent form: stack to single column */
+      #intent-form {{ grid-template-columns: 1fr; padding: 8px 12px !important; }}
+      #intent-form input, #intent-form textarea {{ font-size: 16px; padding: 8px 10px; }}
+      #intent-form .row-full {{ flex-wrap: wrap; gap: 6px; }}
+      #intent-form button {{ flex: 1; min-width: 120px; padding: 10px 12px; }}
+      .quick-btns {{ padding: 6px 12px 10px; }}
+      .quick-btns button {{ flex: 1 1 calc(50% - 6px); font-size: 12px; padding: 8px 10px; }}
+      /* local bridge form */
+      #local-form {{ padding: 8px 12px !important; }}
+      #local-form select, #local-form textarea, #local-form input {{ font-size: 16px !important; }}
+      #local-form button {{ width: 100%; padding: 10px 14px; font-size: 14px; }}
+      /* tables: horizontal scroll instead of squish */
+      .panel .body table {{ display: block; overflow-x: auto; white-space: nowrap; }}
+      th, td {{ padding: 6px 8px; }}
+    }}
+    /* very small (≤380px): tighten further */
+    @media (max-width: 380px) {{
+      .top h1 {{ font-size: 14px; }}
+      .layout {{ padding: 6px; }}
+      .panel h2 {{ font-size: 11px; padding: 7px 10px; }}
+      .quick-btns button {{ flex-basis: 100%; }}
+    }}
     .col {{ display: flex; flex-direction: column; gap: 12px; min-height: 0; }}
     .panel {{
       background: var(--panel); border: 1px solid var(--border);
