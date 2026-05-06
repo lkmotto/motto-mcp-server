@@ -71,6 +71,33 @@ def _decision_row_to_dict(r: asyncpg.Record) -> dict[str, Any]:
     }
 
 
+def _pending_row_to_dict(r: asyncpg.Record) -> dict[str, Any]:
+    payload = r["move_payload"]
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (TypeError, ValueError):
+            payload = {}
+    return {
+        "id": int(r["id"]),
+        "run_id": r["run_id"],
+        "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+        "repo": r["repo"],
+        "kind": r["kind"],
+        "title": r["title"],
+        "rationale": r["rationale"] or "",
+        "intent": r["intent"] or "",
+        "priority": int(r["priority"] or 0),
+        "move_payload": payload,
+        "status": r["status"],
+        "approved_by": r["approved_by"],
+        "approved_at": r["approved_at"].isoformat() if r["approved_at"] else None,
+        "applied_at": r["applied_at"].isoformat() if r["applied_at"] else None,
+        "apply_detail": r["apply_detail"] or "",
+    }
+
+
 def _artifact_row_to_dict(r: asyncpg.Record) -> dict[str, Any]:
     return {
         "id": r["id"],
@@ -744,3 +771,103 @@ class Database:
                 }
                 for r in rows
             ]
+
+    # ── Director pending moves (motto-director PR #41) ───────────────────
+    # The pending_moves table is owned by motto-director's migrations
+    # (0005_pending_moves.sql, public schema). The cockpit reads/writes the
+    # same rows so humans can approve or reject before director acts.
+
+    async def director_pending_moves(
+        self,
+        *,
+        status: str = "pending",
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, run_id, created_at, updated_at, repo, kind,
+                       title, rationale, intent, priority, move_payload,
+                       status, approved_by, approved_at, applied_at,
+                       apply_detail
+                FROM public.pending_moves
+                WHERE status = $1
+                ORDER BY priority DESC, created_at DESC
+                LIMIT $2
+                """,
+                status,
+                int(limit),
+            )
+            return [_pending_row_to_dict(r) for r in rows]
+
+    async def director_pending_counts(self) -> dict[str, int]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT status, count(*)::int AS n
+                FROM public.pending_moves
+                GROUP BY status
+                """
+            )
+            return {r["status"]: r["n"] for r in rows}
+
+    async def director_approve_move(
+        self, *, move_id: int, approved_by: str
+    ) -> bool:
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE public.pending_moves
+                SET status = 'approved',
+                    approved_by = $2,
+                    approved_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = $1 AND status = 'pending'
+                """,
+                int(move_id),
+                approved_by,
+            )
+            # asyncpg returns 'UPDATE n'
+            return result.endswith(" 1")
+
+    async def director_reject_move(
+        self, *, move_id: int, approved_by: str
+    ) -> bool:
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE public.pending_moves
+                SET status = 'rejected',
+                    approved_by = $2,
+                    approved_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = $1 AND status = 'pending'
+                """,
+                int(move_id),
+                approved_by,
+            )
+            return result.endswith(" 1")
+
+    async def director_bulk_approve(
+        self, *, move_ids: list[int], approved_by: str
+    ) -> int:
+        if not move_ids:
+            return 0
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE public.pending_moves
+                SET status = 'approved',
+                    approved_by = $2,
+                    approved_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = ANY($1::bigint[]) AND status = 'pending'
+                """,
+                [int(i) for i in move_ids],
+                approved_by,
+            )
+            # 'UPDATE n'
+            try:
+                return int(result.split()[-1])
+            except (ValueError, IndexError):
+                return 0
