@@ -3,28 +3,19 @@
 Routes:
     /cockpit                    Single-page UI (HTML)
     /cockpit/state.json         Live state for polling (auth)
-    /cockpit/chat               POST: chat with director (DeepSeek V4-Flash)
+    /cockpit/chat               POST: chat with director (DeepSeek V4-Flash + tools)
     /cockpit/intent             POST: submit a manual intent / nudge
 
 The chat endpoint uses DeepSeek's OpenAI-compatible API (key:
 DEEPSEEK_API_KEY in motto-core-prd). The server-side prompt context
-includes live fleet state so the director can answer questions and
-propose actions.
+includes live fleet state. As of 2026-05-06 chat exposes a function-
+calling palette (see chat_tools.py) so the director can run real reads
+and file pending_moves through the same approval queue Luke already
+uses. Manual approval mode (DIRECTOR_APPROVAL_MODE=manual) is preserved.
 
-Provider history (May 2026):
-  - Originally Anthropic /v1/messages via API key.
-  - 2026-01-09: switched to Claude Max OAuth (anthropics blocked direct
-    OAuth POSTs to /v1/messages).
-  - 2026-04: shimmed via Claude Code CLI subprocess (`claude -p`) when
-    OAuth-on-/v1/messages was killed for good.
-  - 2026-05-05: cancelled Claude Max sub. The CLI subprocess shim
-    timed out at 120s under load and the underlying account hit
-    "Credit balance too low" because ANTHROPIC_API_KEY env precedence
-    wins over CLAUDE_CODE_OAUTH_TOKEN in non-interactive `-p` mode
-    (anthropics/claude-code#5300).
-  - 2026-05-05: migrated to DeepSeek V4-Flash. Single-provider,
-    OpenAI-compatible, $0.14/$0.28 per M tokens, 1M context. Mirrors
-    motto-director's deepseek-only chain (motto-director PR #36).
+Provider: DeepSeek V4-Flash, single-provider, OpenAI-compatible,
+1M context. Mirrors motto-director's deepseek-only chain. Earlier
+Claude Max / Claude Code CLI shims are gone.
 
 Submitting an intent inserts into fleet.intents with source='cockpit-user',
 so motto-director will pick it up on the next consume_open_intents call.
@@ -45,6 +36,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from .db import Database
+from . import chat_tools
 
 logger = logging.getLogger(__name__)
 
@@ -73,34 +65,47 @@ def _unauth_html() -> HTMLResponse:
     )
 
 
-# ── Claude Max OAuth chat ─────────────────────────────────────────────────────
-
-
-CLAUDE_CODE_SYSTEM_PREFIX = (
-    "You are Claude Code, Anthropic's official CLI for Claude.\n\n"
-)
+# ── Director chat (DeepSeek + tools) ──────────────────────────────────────────
 
 DIRECTOR_PERSONA = (
-    "You are the Motto Director — the orchestrator brain of Luke Motto's "
+    "You are the Motto Director \u2014 the orchestrator brain of Luke Motto's "
     "AI agent fleet. You speak conversationally and concisely, like a "
-    "trusted technical co-founder. You have access to live fleet state "
-    "(provided below) and can propose concrete next moves.\n\n"
-    "When the user asks about fleet status, reference the data shown. "
-    "When they propose work, give a crisp plan. When they nudge an agent, "
-    "summarize what you'd tell the agent and suggest the user submit "
-    "that as an intent. Never invent fleet data — if something isn't in "
-    "the context, say so.\n\n"
-    "## Local bridge\n\n"
-    "Luke has a 'local bridge' panel in the cockpit: a queue of tasks the "
-    "laptop runner picks up. Supported kinds: echo, shell, read_file, "
-    "write_file, screenshot, ocr, claude_code (spawns Claude Code locally "
-    "so quota comes from his Claude Max session, not the deployed OAuth "
-    "token), browser. When something is best done on his machine — e.g. "
-    "reviewing comp picks in his appraisal pipeline, reading a local file, "
-    "capturing the screen, or spawning a Claude Code session in a repo — "
-    "propose the exact JSON payload he should paste into that panel. "
-    "Format suggestions as a fenced ```json block so they're easy to copy. "
-    "Doctrine reminder: never auto-send emails to AMCs from any agent.\n"
+    "trusted technical co-founder. You have live fleet state in the system "
+    "prompt and a set of TOOLS that let you act, not just talk.\n\n"
+    "## Tools you have\n\n"
+    "You can READ state and PROPOSE moves. Reads run inline. Proposals "
+    "file rows into the cockpit's pending_moves queue with status='pending' "
+    "\u2014 Luke approves them via the approval queue UI before they execute. "
+    "You never bypass that gate.\n\n"
+    "Reads: list_pending_moves, list_verifications, list_capability_requests, "
+    "get_trust_scores, get_fleet_status. Use these instead of guessing.\n\n"
+    "Write-intent: propose_verify_move (verify an applied move and update "
+    "trust), propose_file_issue (track work in a repo), propose_noop (queue "
+    "sanity ping). Anything destructive (merge_pr, spawn_session, compound_pr) "
+    "is intentionally NOT in your palette \u2014 those flow through director's "
+    "normal cycle.\n\n"
+    "Capabilities: request_capability files a request when you need a "
+    "resource (API key, OAuth scope, connector) you don't currently have. "
+    "decide_capability_request grants/denies pending requests, but only "
+    "when Luke explicitly says to.\n\n"
+    "## How to operate\n\n"
+    "1. When asked about state, call the read tool first. Don't speculate.\n"
+    "2. When Luke gives a directive (\"verify move 97\", \"track this as an "
+    "issue\", \"we need a github token\"), pick the right tool and call it. "
+    "Echo the resulting queued_move_id or request_id back so he can act on "
+    "it.\n"
+    "3. After a tool call returns, summarize what happened in one or two "
+    "sentences. Don't re-dump the raw payload.\n"
+    "4. If a tool returns an error, surface it clearly and suggest a fix "
+    "\u2014 don't silently retry.\n"
+    "5. Never invent move IDs, repo names, capability names, or trust "
+    "numbers. If you don't have a value, list_* it first.\n\n"
+    "## Standing rules\n\n"
+    "- Never auto-send emails to AMCs from any agent.\n"
+    "- Manual approval mode is sacred. Filing a pending_move is fine; "
+    "approving it is Luke's call.\n"
+    "- Trust scores update only on definitive (passed/failed) verifications. "
+    "Inconclusive and error don't move the needle.\n"
 )
 
 
@@ -158,9 +163,11 @@ DEEPSEEK_TIMEOUT_S = float(os.environ.get("DEEPSEEK_TIMEOUT_S", "120"))
 
 async def call_deepseek(
     system: str,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     model: str | None = None,
     max_tokens: int = 1024,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Call DeepSeek's OpenAI-compatible chat completions API.
 
@@ -169,14 +176,19 @@ async def call_deepseek(
     secret via .github/workflows/sync-deepseek-secret.yml in motto-director).
 
     `messages` is the conversation history. The system prompt is prepended
-    as a `system` role message.
+    as a `system` role message. When `tools` is provided, the model can
+    return tool_calls in its response (OpenAI function-calling shape); the
+    caller is responsible for executing them and re-prompting with the
+    results.
 
-    Returns a dict in the same shape the previous Claude-Max-CLI shim
-    returned, so `_extract_text` and the /cockpit/chat handler don't need
-    to change:
-        success  -> {type: "message", content: [{type: "text", text: ...}],
-                     model, usage, ...}
-        error    -> {error: "...", type: "config_error"|"upstream_error"|...}
+    Returns a dict that always carries:
+        type     : "message" on success, "error" on failure
+        content  : [{type:"text", text}]   (assistant text, possibly empty)
+        tool_calls: list of OpenAI tool_call objects when present
+        finish_reason: stop | tool_calls | length | ...
+        message  : raw OpenAI assistant message (echoed for re-injection)
+        model, usage, id
+        error    : on failure
     """
     api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key:
@@ -188,33 +200,53 @@ async def call_deepseek(
     if not messages:
         return {"error": "no messages", "type": "config_error"}
 
-    last = messages[-1]
-    if last.get("role") != "user":
-        return {
-            "error": "last message must be from the user",
-            "type": "config_error",
-        }
-
     chosen_model = model or DEEPSEEK_DEFAULT_MODEL
 
     # OpenAI-compatible chat completions: prepend system as a role-message
     # rather than relying on a separate system parameter (DeepSeek accepts
     # both but role-message is more portable).
-    payload_messages: list[dict[str, str]] = [
+    payload_messages: list[dict[str, Any]] = [
         {"role": "system", "content": system}
     ]
     for m in messages:
         role = m.get("role", "user")
-        content = m.get("content", "") or ""
-        if role in ("user", "assistant") and content:
-            payload_messages.append({"role": role, "content": content})
+        if role == "system":
+            continue  # already injected
+        if role == "tool":
+            # Tool result message — must include tool_call_id + content (str)
+            payload_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": m.get("tool_call_id"),
+                    "content": m.get("content") or "",
+                }
+            )
+            continue
+        if role == "assistant":
+            # Assistant turn — may carry tool_calls; preserve them so the
+            # model sees its prior decisions.
+            assistant_msg: dict[str, Any] = {
+                "role": "assistant",
+                "content": m.get("content") or "",
+            }
+            if m.get("tool_calls"):
+                assistant_msg["tool_calls"] = m["tool_calls"]
+            payload_messages.append(assistant_msg)
+            continue
+        if role == "user":
+            content = m.get("content", "") or ""
+            if content:
+                payload_messages.append({"role": "user", "content": content})
 
-    body = {
+    body: dict[str, Any] = {
         "model": chosen_model,
         "messages": payload_messages,
         "max_tokens": max_tokens,
         "stream": False,
     }
+    if tools:
+        body["tools"] = tools
+        body["tool_choice"] = tool_choice or "auto"
 
     url = f"{DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions"
     headers = {
@@ -266,10 +298,17 @@ async def call_deepseek(
             "status_code": 502,
             "detail": envelope,
         }
-    text = (choices[0].get("message") or {}).get("content") or ""
+    choice0 = choices[0] or {}
+    msg = choice0.get("message") or {}
+    text = msg.get("content") or ""
+    tool_calls = msg.get("tool_calls") or []
+    finish_reason = choice0.get("finish_reason") or "stop"
     return {
         "type": "message",
         "content": [{"type": "text", "text": text}],
+        "tool_calls": tool_calls,
+        "finish_reason": finish_reason,
+        "message": msg,  # raw assistant turn for re-injection
         "model": envelope.get("model") or chosen_model,
         "usage": envelope.get("usage") or {},
         "id": envelope.get("id"),
@@ -326,6 +365,20 @@ def register_routes(mcp, db: Database) -> None:
 
     @mcp.custom_route("/cockpit/chat", methods=["POST"])
     async def cockpit_chat(request: Request):
+        """Director chat with tool-calling.
+
+        Loop: model -> (text, tool_calls). If tool_calls present, dispatch
+        each one server-side, append assistant + tool messages to history,
+        re-prompt. Stop when finish_reason='stop' or MAX_TOOL_HOPS hit.
+
+        Response carries:
+          reply         : final assistant text
+          tool_calls    : flat list of every tool call run this turn
+                          (name, arguments, result, ok). UI renders these
+                          inline so Luke sees what the director did.
+          hops          : how many model rounds we ran
+          model, usage, error
+        """
         if not cockpit_auth_ok(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         try:
@@ -333,10 +386,16 @@ def register_routes(mcp, db: Database) -> None:
         except Exception:
             return JSONResponse({"error": "invalid json"}, status_code=400)
 
-        history: list[dict[str, str]] = body.get("messages") or []
-        # Validate messages
-        clean: list[dict[str, str]] = []
-        for m in history:
+        # Allow tools to be disabled per-request for debugging / regressions.
+        tools_enabled = bool(body.get("tools_enabled", True))
+        chat_user = str(body.get("chat_user") or "luke")
+        max_tokens = int(body.get("max_tokens") or 1024)
+
+        # Inbound history: accept user / assistant (str content). Older clients
+        # don't send tool messages — we rebuild those server-side per turn.
+        raw_history = body.get("messages") or []
+        clean: list[dict[str, Any]] = []
+        for m in raw_history:
             if not isinstance(m, dict):
                 continue
             role = m.get("role")
@@ -348,19 +407,115 @@ def register_routes(mcp, db: Database) -> None:
 
         fleet_ctx = await _build_fleet_context(db)
         system = DIRECTOR_PERSONA + "\n" + fleet_ctx
-        resp = await call_deepseek(
-            system=system,
-            messages=clean,
-            max_tokens=int(body.get("max_tokens") or 1024),
-        )
-        text = _extract_text(resp)
+        # Pull verify_move out of server.py at runtime to avoid an import
+        # cycle (server imports cockpit, not the other way around).
+        from . import server as _server
+        verify_move_fn = getattr(_server, "verify_move")
+
+        tools = chat_tools.TOOL_SCHEMAS if tools_enabled else None
+        tool_log: list[dict[str, Any]] = []
+        last_resp: dict[str, Any] = {}
+
+        for hop in range(chat_tools.MAX_TOOL_HOPS):
+            resp = await call_deepseek(
+                system=system,
+                messages=clean,
+                max_tokens=max_tokens,
+                tools=tools,
+            )
+            last_resp = resp
+            if resp.get("error"):
+                return JSONResponse(
+                    {
+                        "reply": _extract_text(resp),
+                        "tool_calls": tool_log,
+                        "hops": hop,
+                        "error": resp.get("error"),
+                        "model": resp.get("model"),
+                        "usage": resp.get("usage"),
+                    }
+                )
+
+            tool_calls = resp.get("tool_calls") or []
+            finish_reason = resp.get("finish_reason") or "stop"
+
+            if not tool_calls:
+                break
+
+            # Append assistant turn (with tool_calls) to history so the
+            # model sees its own decisions on the next round.
+            assistant_msg = resp.get("message") or {}
+            clean.append(
+                {
+                    "role": "assistant",
+                    "content": assistant_msg.get("content") or "",
+                    "tool_calls": tool_calls,
+                }
+            )
+
+            # Dispatch each tool call and append a `tool` role result.
+            for tc in tool_calls:
+                tc_id = tc.get("id")
+                fn = (tc.get("function") or {})
+                name = fn.get("name") or ""
+                raw_args = fn.get("arguments") or "{}"
+                try:
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args or {})
+                except json.JSONDecodeError:
+                    args = {}
+                result = await chat_tools.dispatch(
+                    name=name,
+                    arguments=args,
+                    db=db,
+                    chat_user=chat_user,
+                    verify_move_fn=verify_move_fn,
+                )
+                tool_log.append(
+                    {
+                        "name": name,
+                        "arguments": args,
+                        "result": result,
+                        "ok": not (isinstance(result, dict) and result.get("error")),
+                        "hop": hop,
+                    }
+                )
+                # Tool result content must be a string per OpenAI spec.
+                clean.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": json.dumps(result, default=str)[:8000],
+                    }
+                )
+
+            if finish_reason == "stop" and not tool_calls:
+                break
+        else:
+            # Hit MAX_TOOL_HOPS — force a final summarization round
+            # without tools to make sure the user gets text back.
+            resp = await call_deepseek(
+                system=system
+                + "\n\n[note: tool budget exhausted, summarize what you did]",
+                messages=clean,
+                max_tokens=max_tokens,
+                tools=None,
+            )
+            last_resp = resp
+
+        text = _extract_text(last_resp)
         return JSONResponse(
             {
                 "reply": text,
-                "raw_type": resp.get("type"),
-                "model": resp.get("model"),
-                "usage": resp.get("usage"),
-                "error": resp.get("error"),
+                "tool_calls": tool_log,
+                "hops": len(
+                    [tc for tc in tool_log if tc.get("hop") is not None]
+                )
+                and (max(tc.get("hop") for tc in tool_log) + 1)
+                or 0,
+                "raw_type": last_resp.get("type"),
+                "model": last_resp.get("model"),
+                "usage": last_resp.get("usage"),
+                "error": last_resp.get("error"),
             }
         )
 
@@ -832,6 +987,24 @@ def _render_cockpit(token: str) -> str:
     .msg.assistant {{ background: #161b22; border: 1px solid var(--border); align-self: flex-start; }}
     .msg.thinking {{ color: var(--muted); font-style: italic; }}
     .msg.error {{ background: #f8514922; border: 1px solid var(--err); color: var(--err); }}
+    .msg.tool {{
+      background: #0d1117; border: 1px dashed var(--border);
+      align-self: stretch; max-width: 100%; padding: 6px 10px;
+      font-size: 12px; color: var(--fg); white-space: normal;
+    }}
+    .msg.tool.tool-ok .tool-ico {{ color: var(--ok); font-weight: 700; }}
+    .msg.tool.tool-err .tool-ico {{ color: var(--err); font-weight: 700; }}
+    .msg.tool .tool-head code {{ background: #1f2937; padding: 1px 5px; border-radius: 3px; }}
+    .msg.tool .tool-args {{ color: var(--muted); font-family: ui-monospace, monospace; font-size: 11px; }}
+    .msg.tool .tool-summary {{ margin-top: 4px; color: var(--muted); }}
+    .msg.tool .tool-summary b {{ color: var(--accent); }}
+    .msg.tool details.tool-raw {{ margin-top: 4px; }}
+    .msg.tool details.tool-raw summary {{ cursor: pointer; color: var(--muted); font-size: 11px; }}
+    .msg.tool details.tool-raw pre {{
+      background: #010409; border: 1px solid var(--border); border-radius: 4px;
+      padding: 6px 8px; overflow-x: auto; font-size: 11px; color: var(--fg);
+      max-height: 240px;
+    }}
     #chat-form {{
       display: flex; gap: 8px; padding: 10px; border-top: 1px solid var(--border);
     }}
@@ -1031,6 +1204,51 @@ function addChatMsg(role, text, cls) {{
   return div;
 }}
 
+function addToolCallMsg(tc) {{
+  // tc = {{name, arguments, result, ok, hop}}
+  const log = document.getElementById("chat-log");
+  const wrap = document.createElement("div");
+  wrap.className = "msg tool" + (tc.ok ? " tool-ok" : " tool-err");
+  const head = document.createElement("div");
+  head.className = "tool-head";
+  const ico = tc.ok ? "✓" : "⚠";
+  head.innerHTML = "<span class='tool-ico'>" + ico + "</span>" +
+    " <code>" + escapeHtml(tc.name) + "</code> " +
+    "<span class='tool-args'>" + escapeHtml(JSON.stringify(tc.arguments || {{}})) + "</span>";
+  wrap.appendChild(head);
+  // Highlight queued move IDs / request IDs so they're glanceable.
+  const r = tc.result || {{}};
+  const summary = document.createElement("div");
+  summary.className = "tool-summary";
+  if (r.queued_move_id) {{
+    summary.innerHTML = "queued move <b>#" + r.queued_move_id + "</b>" +
+      " (" + escapeHtml(r.kind || "?") + ", " + escapeHtml(r.status || "pending") + ")" +
+      " — approve in queue panel";
+  }} else if (r.request_id) {{
+    summary.innerHTML = "capability request <b>#" + r.request_id + "</b>" +
+      " (" + escapeHtml(r.status || "pending") + ")";
+  }} else if (r.error) {{
+    summary.innerHTML = "<span class='err'>" + escapeHtml(r.error) + "</span>";
+  }} else if (typeof r.count === "number") {{
+    summary.textContent = r.count + " rows";
+  }} else {{
+    summary.textContent = "ok";
+  }}
+  wrap.appendChild(summary);
+  // Collapsible raw JSON for inspection.
+  const det = document.createElement("details");
+  det.className = "tool-raw";
+  const sum = document.createElement("summary");
+  sum.textContent = "raw";
+  det.appendChild(sum);
+  const pre = document.createElement("pre");
+  pre.textContent = JSON.stringify(r, null, 2);
+  det.appendChild(pre);
+  wrap.appendChild(det);
+  log.appendChild(wrap);
+  log.scrollTop = log.scrollHeight;
+}}
+
 document.getElementById("chat-form").addEventListener("submit", async (ev) => {{
   ev.preventDefault();
   const input = document.getElementById("chat-input");
@@ -1050,6 +1268,20 @@ document.getElementById("chat-form").addEventListener("submit", async (ev) => {{
     }});
     const d = await r.json();
     thinking.remove();
+    // Render any tool calls inline first so the UI matches the order
+    // of work — tool actions appear, then the assistant's recap.
+    if (Array.isArray(d.tool_calls)) {{
+      for (const tc of d.tool_calls) {{
+        addToolCallMsg(tc);
+      }}
+      // If a propose_* tool fired, refresh the pending approvals panel
+      // so the new row appears without a manual reload.
+      const filed = d.tool_calls.some(t =>
+        t.ok && t.result && t.result.queued_move_id);
+      if (filed && typeof refreshDirectorPending === "function") {{
+        refreshDirectorPending();
+      }}
+    }}
     if (d.error || (d.reply && d.reply.startsWith("[error"))) {{
       const msg = d.reply || ("error: " + JSON.stringify(d.error));
       addChatMsg("assistant", msg, "error");

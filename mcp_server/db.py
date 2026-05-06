@@ -1163,6 +1163,54 @@ class Database:
     #   - capability_requests : director-asks-human for resources
     #   - trust_scores        : rolling per-scope confidence
 
+    async def enqueue_pending_move(
+        self,
+        *,
+        run_id: str,
+        repo: str,
+        kind: str,
+        title: str,
+        move_payload: dict[str, Any],
+        rationale: str = "",
+        intent: str = "",
+        priority: int = 0,
+    ) -> dict[str, Any]:
+        """Insert a row into public.pending_moves. Used by chat-initiated
+        moves so they flow through the same approval queue motto-director uses.
+
+        Returns the inserted row (id, status='pending', etc.) so the caller
+        can echo it back to the chat UI for approval.
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO public.pending_moves
+                  (run_id, repo, kind, title, rationale, intent, priority,
+                   move_payload, status)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'pending')
+                RETURNING id, run_id, created_at, repo, kind, title,
+                          rationale, intent, priority, move_payload, status
+                """,
+                str(run_id),
+                str(repo),
+                str(kind),
+                str(title),
+                str(rationale or ""),
+                str(intent or ""),
+                int(priority),
+                json.dumps(move_payload or {}),
+            )
+            d = dict(row)
+            if d.get("created_at") is not None:
+                d["created_at"] = d["created_at"].isoformat()
+            mp = d.get("move_payload")
+            if isinstance(mp, str):
+                try:
+                    d["move_payload"] = json.loads(mp)
+                except json.JSONDecodeError:
+                    pass
+            return d
+
     async def fetch_pending_move(self, move_id: int) -> dict[str, Any] | None:
         """Read a single pending_moves row by id. The table lives in `public`
         and is owned by motto-director migrations; we just read it."""
