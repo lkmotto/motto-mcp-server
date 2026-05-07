@@ -226,6 +226,8 @@ async def call_deepseek(
             # Assistant turn — may carry tool_calls; preserve them so the
             # model sees its prior decisions. OpenAI/DeepSeek strict mode
             # requires content=null when tool_calls is set; '' is rejected.
+            # DeepSeek thinking-mode also requires reasoning_content to be
+            # round-tripped back when present on the prior assistant turn.
             tcs = m.get("tool_calls")
             if tcs:
                 assistant_msg: dict[str, Any] = {
@@ -238,6 +240,9 @@ async def call_deepseek(
                     "role": "assistant",
                     "content": m.get("content") or "",
                 }
+            rc = m.get("reasoning_content")
+            if rc:
+                assistant_msg["reasoning_content"] = rc
             payload_messages.append(assistant_msg)
             continue
         if role == "user":
@@ -457,15 +462,18 @@ def register_routes(mcp, db: Database) -> None:
                 break
 
             # Append assistant turn (with tool_calls) to history so the
-            # model sees its own decisions on the next round.
+            # model sees its own decisions on the next round. Preserve
+            # reasoning_content so DeepSeek thinking mode does not 400.
             assistant_msg = resp.get("message") or {}
-            clean.append(
-                {
-                    "role": "assistant",
-                    "content": assistant_msg.get("content") or "",
-                    "tool_calls": tool_calls,
-                }
-            )
+            asst_turn: dict[str, Any] = {
+                "role": "assistant",
+                "content": assistant_msg.get("content") or "",
+                "tool_calls": tool_calls,
+            }
+            rc = assistant_msg.get("reasoning_content")
+            if rc:
+                asst_turn["reasoning_content"] = rc
+            clean.append(asst_turn)
 
             # Dispatch each tool call and append a `tool` role result.
             for tc in tool_calls:
