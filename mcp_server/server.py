@@ -741,13 +741,110 @@ def _render_dashboard(agents: list[dict[str, Any]], events: list[dict[str, Any]]
 _register_cockpit_routes(mcp, db)
 
 
+def _mount_compat(sub: FastMCP, name: str) -> None:
+    """Cross-version FastMCP.mount shim.
+
+    Older fastmcp (<2.13) used ``namespace=``; newer versions (>=2.13) use
+    ``prefix=``. Try the new kwarg first and fall back so this works on every
+    fastmcp the deployment might be pinned to.
+    """
+    try:
+        mcp.mount(sub, prefix=name)
+    except TypeError:
+        mcp.mount(sub, namespace=name)  # type: ignore[call-arg]
+
+
+def _mount_domain_servers() -> list[str]:
+    """Mount the per-domain sub-MCPs onto the main app.
+
+    Returns the list of namespaces successfully mounted. Each sub-server
+    reads its own credentials lazily — mounting never raises, even if a
+    given upstream API key is absent. The first call into a tool whose
+    upstream creds are missing raises a clear RuntimeError.
+    """
+    mounted: list[str] = []
+
+    # grabber — Neon-backed credential rotation queue
+    try:
+        from servers.grabber.server import mcp as grabber_mcp  # noqa: PLC0415
+
+        _mount_compat(grabber_mcp, "grabber")
+        mounted.append("grabber")
+    except Exception:  # pragma: no cover
+        logger.exception("failed to mount grabber sub-server")
+
+    # cloudflare — accounts/zones/DNS/Workers/Pages/KV/R2
+    try:
+        from servers.cloudflare.server import mcp as cloudflare_mcp  # noqa: PLC0415
+
+        _mount_compat(cloudflare_mcp, "cloudflare")
+        mounted.append("cloudflare")
+    except Exception:  # pragma: no cover
+        logger.exception("failed to mount cloudflare sub-server")
+
+    # northflank — projects/services/jobs/secret-groups
+    try:
+        from servers.northflank.server import mcp as northflank_mcp  # noqa: PLC0415
+
+        _mount_compat(northflank_mcp, "northflank")
+        mounted.append("northflank")
+    except Exception:  # pragma: no cover
+        logger.exception("failed to mount northflank sub-server")
+
+    # github — repos/issues/pulls + Actions secret provisioning
+    try:
+        from servers.github.server import mcp as github_mcp  # noqa: PLC0415
+
+        _mount_compat(github_mcp, "github")
+        mounted.append("github")
+    except Exception:  # pragma: no cover
+        logger.exception("failed to mount github sub-server")
+
+    # linear — GraphQL issues/projects/comments
+    try:
+        from servers.linear.server import mcp as linear_mcp  # noqa: PLC0415
+
+        _mount_compat(linear_mcp, "linear")
+        mounted.append("linear")
+    except Exception:  # pragma: no cover
+        logger.exception("failed to mount linear sub-server")
+
+    # apollo — people search/enrich + sequence ops
+    try:
+        from servers.apollo.server import mcp as apollo_mcp  # noqa: PLC0415
+
+        _mount_compat(apollo_mcp, "apollo")
+        mounted.append("apollo")
+    except Exception:  # pragma: no cover
+        logger.exception("failed to mount apollo sub-server")
+
+    # supabase — read-only SELECT passthrough
+    try:
+        from servers.supabase.server import mcp as supabase_mcp  # noqa: PLC0415
+
+        _mount_compat(supabase_mcp, "supabase")
+        mounted.append("supabase")
+    except Exception:  # pragma: no cover
+        logger.exception("failed to mount supabase sub-server")
+
+    # doppler — allowlist-gated secret reads + audit/rename
+    try:
+        from servers.doppler.server import build_server as build_doppler  # noqa: PLC0415
+
+        _mount_compat(build_doppler(), "doppler")
+        mounted.append("doppler")
+    except Exception:  # pragma: no cover
+        logger.exception("failed to mount doppler sub-server")
+
+    return mounted
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
 
-    # Mount domain servers when requested (e.g. all-in-one cluster deployment).
     if os.environ.get("MOTTO_MCP_MOUNT_DOMAIN_SERVERS") == "1":
-        from servers.grabber.server import mcp as grabber_mcp  # noqa: PLC0415
-        mcp.mount(grabber_mcp, namespace="grabber")
+        mounted = _mount_domain_servers()
+        logger.info("motto-mcp: mounted domain servers: %s", ", ".join(mounted))
 
     port = int(os.environ.get("PORT", "8080"))
     mcp.run(transport="streamable-http", host="0.0.0.0", port=port)

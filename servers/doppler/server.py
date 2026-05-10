@@ -38,6 +38,39 @@ CANONICAL_PROJECT = "motto-core"
 CANONICAL_CONFIG = "prd"
 DEFAULT_WORKPLACE_ID = "0b22d1310a7c01d97530"
 
+# Read-allowlist for the namespaced ``read_secret`` tool. Only these names can
+# be returned with their values. Everything else gets a 403-style refusal at
+# the tool boundary so a hostile caller cannot exfiltrate arbitrary secrets
+# even if their MCP session is compromised. Override at runtime by setting
+# ``MOTTO_DOPPLER_ALLOWLIST`` to a comma-separated list of names; the env-var
+# value overrides the static default entirely.
+DEFAULT_READ_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "APOLLO_API_KEY",
+        "LINEAR_API_KEY",
+        "NORTHFLANK_API_KEY",
+        "NORTHFLANK_API_TOKEN",
+        "NORHTFLANK_API",  # legacy typo'd alias still used in Doppler
+        "CLOUDFLARE_API_TOKEN",
+        "CLOUDFLARE_API",
+        "SUPABASE_URL",
+        "SUPABASE_SERVICE_KEY",
+        "SUPABASE_SERVICE_ROLE_KEY",
+        "SUPABASE_SECRET_KEY",
+        "OPENAI_API_KEY",
+        "DEEPSEEK_API",
+        "RESEND_API_KEY",
+    }
+)
+
+
+def _read_allowlist() -> frozenset[str]:
+    override = os.environ.get("MOTTO_DOPPLER_ALLOWLIST")
+    if override:
+        names = {n.strip() for n in override.split(",") if n.strip()}
+        return frozenset(names)
+    return DEFAULT_READ_ALLOWLIST
+
 
 # ---------------------------------------------------------------------------
 # HTTP client
@@ -351,6 +384,77 @@ def build_server(client: DopplerClient | None = None) -> FastMCP:
             "from": payload.old_name,
             "to": payload.new_name,
             "old_kept": payload.keep_old,
+        }
+
+    # ---- allowlist-gated read surface --------------------------------------
+
+    @server.tool()
+    async def list_secret_names(
+        project: str = CANONICAL_PROJECT,
+        config: str = CANONICAL_CONFIG,
+    ) -> dict[str, Any]:
+        """List secret NAMES for a project/config.
+
+        Never returns values. Use this to discover what's available before
+        calling :func:`read_secret`.
+        """
+        secrets = await _client().list_secrets(project, config, include_values=False)
+        return {
+            "project": project,
+            "config": config,
+            "names": sorted(secrets.keys()),
+            "count": len(secrets),
+        }
+
+    @server.tool()
+    async def read_secret(
+        name: str,
+        project: str = CANONICAL_PROJECT,
+        config: str = CANONICAL_CONFIG,
+    ) -> dict[str, Any]:
+        """Read a single secret value, gated by the static allowlist.
+
+        Anything outside :data:`DEFAULT_READ_ALLOWLIST` (or the runtime
+        override ``MOTTO_DOPPLER_ALLOWLIST``) is refused at the tool
+        boundary with a 403-style payload — the value never leaves Doppler.
+        Override is comma-separated names.
+
+        Returns: ``{"name", "project", "config", "value", "allowed": True}`` on
+        success, or ``{"name", "allowed": False, "status": 403, "reason"}`` on
+        refusal.
+        """
+        allow = _read_allowlist()
+        if name not in allow:
+            return {
+                "name": name,
+                "project": project,
+                "config": config,
+                "allowed": False,
+                "status": 403,
+                "reason": (
+                    f"'{name}' is not on the Motto Doppler read allowlist. "
+                    "Add it via MOTTO_DOPPLER_ALLOWLIST env override or "
+                    "DEFAULT_READ_ALLOWLIST in source."
+                ),
+            }
+        secret = await _client().get_secret(project, config, name)
+        raw = (secret or {}).get("raw") if isinstance(secret, dict) else None
+        if raw is None:
+            return {
+                "name": name,
+                "project": project,
+                "config": config,
+                "allowed": True,
+                "found": False,
+                "reason": "secret not present in this project/config",
+            }
+        return {
+            "name": name,
+            "project": project,
+            "config": config,
+            "allowed": True,
+            "found": True,
+            "value": raw,
         }
 
     # ---- audit -------------------------------------------------------------
