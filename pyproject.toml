@@ -1,6 +1,6 @@
 [project]
 name = "motto-mcp-server"
-version = "0.1.0"
+version = "3.3.0"
 description = "FastMCP fleet-coordination server backed by Neon Postgres."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -25,6 +25,12 @@ doppler = [
 motto-mcp-server = "mcp_server.server:main"
 motto-doppler-mcp = "servers.doppler.server:main"
 motto-grabber-mcp = "servers.grabber.server:main"
+motto-cloudflare-mcp = "servers.cloudflare.server:main"
+motto-northflank-mcp = "servers.northflank.server:main"
+motto-github-mcp = "servers.github.server:main"
+motto-linear-mcp = "servers.linear.server:main"
+motto-apollo-mcp = "servers.apollo.server:main"
+motto-supabase-mcp = "servers.supabase.server:main"
 
 [build-system]
 requires = ["hatchling"]

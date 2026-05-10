@@ -201,6 +201,56 @@ async def test_rename_keep_old(server, client):
 
 
 @pytest.mark.asyncio
+async def test_list_secret_names_returns_names_only(server):
+    out = await _call(
+        server, "list_secret_names", project=CANONICAL_PROJECT, config=CANONICAL_CONFIG
+    )
+    assert out["count"] == 3
+    assert "GITHUB_TOKEN" in out["names"]
+    # values must NOT appear anywhere in the response
+    serialized = repr(out)
+    assert "ghp_canonical" not in serialized
+    assert "sk-canonical" not in serialized
+
+
+async def _call_args(server, tool_name: str, args: dict[str, Any]) -> Any:
+    tool = await server.get_tool(tool_name)
+    result = await tool.run(arguments=args)
+    payload = result.structured_content
+    if isinstance(payload, dict) and set(payload.keys()) == {"result"}:
+        return payload["result"]
+    return payload
+
+
+@pytest.mark.asyncio
+async def test_read_secret_refuses_outside_allowlist(server, monkeypatch):
+    # GITHUB_TOKEN is NOT in the default allowlist — must be refused.
+    monkeypatch.delenv("MOTTO_DOPPLER_ALLOWLIST", raising=False)
+    out = await _call_args(server, "read_secret", {"name": "GITHUB_TOKEN"})
+    assert out["allowed"] is False
+    assert out["status"] == 403
+    assert "value" not in out
+
+
+@pytest.mark.asyncio
+async def test_read_secret_returns_value_when_allowed(server, client, monkeypatch):
+    monkeypatch.delenv("MOTTO_DOPPLER_ALLOWLIST", raising=False)
+    client.store[(CANONICAL_PROJECT, CANONICAL_CONFIG)]["OPENAI_API_KEY"] = "sk-canonical"
+    out = await _call_args(server, "read_secret", {"name": "OPENAI_API_KEY"})
+    assert out["allowed"] is True
+    assert out["found"] is True
+    assert out["value"] == "sk-canonical"
+
+
+@pytest.mark.asyncio
+async def test_read_secret_runtime_allowlist_override(server, monkeypatch):
+    monkeypatch.setenv("MOTTO_DOPPLER_ALLOWLIST", "GITHUB_TOKEN")
+    out = await _call_args(server, "read_secret", {"name": "GITHUB_TOKEN"})
+    assert out["allowed"] is True
+    assert out["value"] == "ghp_canonical"
+
+
+@pytest.mark.asyncio
 async def test_audit_finds_duplicates_and_drift(server):
     out = await _call(server, "doppler_audit_consolidation")
     dupes = {d["name"]: d for d in out["duplicates"]}
