@@ -35,7 +35,7 @@ jobs:
       # method=get_comments. Single comment per PR, upserts on re-run.
       - name: Post CI failure to PR
         if: failure() && github.event_name == 'pull_request'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const { data: jobsResp } = await github.rest.actions.listJobsForWorkflowRun({
