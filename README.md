@@ -1,5 +1,7 @@
 # motto-mcp-server
 
+[![codecov](https://codecov.io/gh/lkmotto/motto-mcp-server/branch/main/graph/badge.svg)](https://codecov.io/gh/lkmotto/motto-mcp-server)
+
 FastMCP fleet-coordination server, backed by Neon Postgres. Also exposes a
 minimal HTML dashboard so a browser tab can serve as a poor-man's Horizon.
 
