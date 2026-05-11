@@ -1,18 +1,30 @@
+# Managed by fleet automation (MOT-27).
+# Groups minor/patch updates into one PR per ecosystem per week.
+# PRs receive 'auto-merge-ok'; .github/workflows/dependabot-auto-merge.yml
+# auto-merges patch-only group PRs after CI passes.
 version: 2
 updates:
-  - package-ecosystem: "pip"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-      time: "09:00"
-      timezone: "America/Chicago"
-    open-pull-requests-limit: 5
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
-      day: "monday"
-      time: "09:00"
-      timezone: "America/Chicago"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "auto-merge-ok"
+    groups:
+      production-dependencies:
+        patterns:
+          - "*"
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "auto-merge-ok"
+    groups:
+      production-dependencies:
+        patterns:
+          - "*"
