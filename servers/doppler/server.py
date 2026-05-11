@@ -213,7 +213,7 @@ class SecretRenameInput(_ProjectScope):
 # ---------------------------------------------------------------------------
 
 
-def build_server(client: DopplerClient | None = None) -> FastMCP:
+def build_server(client: DopplerClient | None = None) -> FastMCP:  # noqa: C901
     """Construct the FastMCP server with all Doppler tools registered."""
 
     server = FastMCP(

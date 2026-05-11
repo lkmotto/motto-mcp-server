@@ -161,7 +161,7 @@ DEEPSEEK_DEFAULT_MODEL = os.environ.get(
 DEEPSEEK_TIMEOUT_S = float(os.environ.get("DEEPSEEK_TIMEOUT_S", "120"))
 
 
-async def call_deepseek(
+async def call_deepseek(  # noqa: C901
     system: str,
     messages: list[dict[str, Any]],
     model: str | None = None,
@@ -340,7 +340,7 @@ def _extract_text(resp: dict[str, Any]) -> str:
 # ── HTTP routes ───────────────────────────────────────────────────────────────
 
 
-def register_routes(mcp, db: Database) -> None:
+def register_routes(mcp, db: Database) -> None:  # noqa: C901
     """Attach cockpit routes to the FastMCP app."""
 
     @mcp.custom_route("/cockpit", methods=["GET"])
@@ -371,7 +371,7 @@ def register_routes(mcp, db: Database) -> None:
         )
 
     @mcp.custom_route("/cockpit/chat", methods=["POST"])
-    async def cockpit_chat(request: Request):
+    async def cockpit_chat(request: Request):  # noqa: C901
         """Director chat with tool-calling.
 
         Loop: model -> (text, tool_calls). If tool_calls present, dispatch
