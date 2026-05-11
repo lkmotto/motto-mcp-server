@@ -24,6 +24,9 @@ If MOTTO_MCP_AUTH_TOKEN is unset, all paths are open (dev/local mode).
 """
 
 from __future__ import annotations
+import sys as _sys, pathlib as _pathlib  # noqa: E402
+_sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent.parent))
+import sentry_init  # noqa: E402,F401
 
 import json
 import logging
@@ -754,4 +757,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import sentry_sdk as _sentry_sdk
+    try:
+        main()
+    except Exception as _exc:
+        _sentry_sdk.capture_exception(_exc)
+        raise
+
