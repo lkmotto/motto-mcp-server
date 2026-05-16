@@ -28,7 +28,7 @@ from collections import defaultdict
 from typing import Any
 
 import httpx
-from fastmcp import FastMCP
+from fastmcp.server import FastMCP
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)

@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from html import escape as h
 from typing import Any
 
-from fastmcp import FastMCP
+from fastmcp.server import FastMCP
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
@@ -749,7 +749,7 @@ def main() -> None:
         from servers.grabber.server import mcp as grabber_mcp  # noqa: PLC0415
         mcp.mount(grabber_mcp, namespace="grabber")
 
-    port = int(os.environ.get("PORT", "8080"))
+    port = int(os.environ.get("PORT", "8000"))
     mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
 
 

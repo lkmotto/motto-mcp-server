@@ -20,7 +20,7 @@ import os
 from typing import Any
 
 import asyncpg
-from fastmcp import FastMCP
+from fastmcp.server import FastMCP
 
 logger = logging.getLogger(__name__)
 
