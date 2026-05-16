@@ -8,13 +8,22 @@ set LOG_PATH=C:\Users\lkmot\ona-mcp-server\tunnel-service.log
 set ERR_PATH=C:\Users\lkmot\ona-mcp-server\tunnel-service-err.log
 set ENV_PATH=C:\Users\lkmot\ona-mcp-server\.env
 
-if "%NEON_DATABASE_URL%"=="" (
-    if exist "%ENV_PATH%" (
-        for /f "usebackq tokens=1,* delims==" %%A in ("%ENV_PATH%") do (
-            if /I "%%A"=="NEON_DATABASE_URL" set "NEON_DATABASE_URL=%%B"
-            if /I "%%A"=="DATABASE_URL" if "%NEON_DATABASE_URL%"=="" set "NEON_DATABASE_URL=%%B"
-        )
+if exist "%ENV_PATH%" (
+    for /f "usebackq tokens=1,* delims==" %%A in ("%ENV_PATH%") do (
+        if /I "%%A"=="NEON_DATABASE_URL" set "NEON_DATABASE_URL=%%B"
+        if /I "%%A"=="DATABASE_URL" set "DATABASE_URL=%%B"
+        if /I "%%A"=="DATABASE_URL" if "%NEON_DATABASE_URL%"=="" set "NEON_DATABASE_URL=%%B"
     )
+)
+
+REM Start MCP server if nothing is already listening on port 8000
+netstat -ano 2>nul | findstr ":8000 " >nul
+if errorlevel 1 (
+    echo Starting ONA MCP server on port 8000...
+    start "" /B C:\Python314\python.exe -m mcp_server.server 1>> "C:\Users\lkmot\ona-mcp-server\server.log" 2>> "C:\Users\lkmot\ona-mcp-server\server.err"
+    timeout /t 8 /nobreak >nul
+) else (
+    echo MCP server already running on port 8000, skipping start.
 )
 
 REM Only kill existing cloudflared processes that target port 8000 (ONA tunnel)
