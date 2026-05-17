@@ -34,6 +34,7 @@ from html import escape as h
 from typing import Any
 
 from fastmcp.server import FastMCP
+from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
@@ -56,6 +57,26 @@ async def _lifespan(_app):
         await db.close()
 
 
+def _expected_auth_token() -> str | None:
+    """Fetch the configured bearer token (legacy alias supported)."""
+    return os.environ.get("MOTTO_MCP_AUTH_TOKEN") or os.environ.get("MCP_AUTH_TOKEN")
+
+
+def _mcp_auth() -> StaticTokenVerifier | None:
+    """Protect /mcp when a token is configured; stay open for local/dev."""
+    token = _expected_auth_token()
+    if not token:
+        return None
+    return StaticTokenVerifier(
+        tokens={
+            token: {
+                "client_id": "motto-mcp-client",
+                "scopes": [],
+            }
+        }
+    )
+
+
 mcp = FastMCP(
     "motto-fleet",
     instructions=(
@@ -64,6 +85,7 @@ mcp = FastMCP(
         "and post cross-agent intents. motto-director consumes via "
         "get_fleet_status / get_recent_events."
     ),
+    auth=_mcp_auth(),
     lifespan=_lifespan,
 )
 
@@ -562,11 +584,11 @@ async def get_trust_scores(scope: str | None = None) -> list[dict[str, Any]]:
 
 
 def _auth_ok(request: Request) -> bool:
-    """Accept Bearer header or ?token= query, must equal MOTTO_MCP_AUTH_TOKEN.
+    """Accept Bearer header or ?token= query for the configured auth token.
 
     When the env var is unset, all requests pass (dev/local mode).
     """
-    expected = os.environ.get("MOTTO_MCP_AUTH_TOKEN")
+    expected = _expected_auth_token()
     if not expected:
         return True
     auth_header = request.headers.get("authorization", "")
