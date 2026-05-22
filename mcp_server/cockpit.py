@@ -791,31 +791,33 @@ def register_routes(mcp, db: Database) -> None:
 
     @mcp.custom_route("/cockpit/epics", methods=["GET"])
     async def cockpit_epics(request: Request):
-        """Server-rendered HTML page listing active epics with droid session
-        links, GitHub Issue links, cost-so-far, last-progress timestamp,
-        and pause/kill/reprompt buttons.
-        """
+        """STUB -- Worker F implements list view of all epics. See Issue #64 criterion 8."""
         if not cockpit_auth_ok(request):
             return _unauth_html()
-        raise NotImplementedError("Worker F: implement /cockpit/epics HTML view")
+        token = request.query_params.get("token", "")
+        return HTMLResponse(
+            '<h1>Epics cockpit view</h1><p>Worker F stub -- list view coming soon.</p>'
+            '<p><a href="/cockpit">Back to cockpit</a></p>',
+            status_code=200,
+        )
 
     @mcp.custom_route("/cockpit/epics/{epic_id}/pause", methods=["POST"])
     async def cockpit_epic_pause(request: Request):
         if not cockpit_auth_ok(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        raise NotImplementedError("Worker F: implement /cockpit/epics/pause POST")
+        return JSONResponse({"ok": False, "stub": True, "message": "Worker F stub"}, status_code=501)
 
     @mcp.custom_route("/cockpit/epics/{epic_id}/kill", methods=["POST"])
     async def cockpit_epic_kill(request: Request):
         if not cockpit_auth_ok(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        raise NotImplementedError("Worker F: implement /cockpit/epics/kill POST")
+        return JSONResponse({"ok": False, "stub": True, "message": "Worker F stub"}, status_code=501)
 
     @mcp.custom_route("/cockpit/epics/{epic_id}/reprompt", methods=["POST"])
     async def cockpit_epic_reprompt(request: Request):
         if not cockpit_auth_ok(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        raise NotImplementedError("Worker F: implement /cockpit/epics/reprompt POST")
+        return JSONResponse({"ok": False, "stub": True, "message": "Worker F stub"}, status_code=501)
 
     # ── Director approval queue (motto-director PR #41) ─────────────────
     # Surfaces public.pending_moves rows so a human can approve / reject
