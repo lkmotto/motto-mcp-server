@@ -924,6 +924,101 @@ class Database:
             )
             return [_pending_row_to_dict(r) for r in rows]
 
+    async def director_claim_next_step(
+        self,
+        *,
+        runner_id: str,
+        kinds: list[str] | None = None,
+        limit: int = 1,
+    ) -> list[dict[str, Any]]:
+        """Atomically claim up to `limit` approved pending_moves rows for this runner.
+
+        Uses FOR UPDATE SKIP LOCKED so multiple droids polling the same queue
+        do not double-claim. Returns the claimed rows in priority DESC,
+        created_at ASC order (high-priority moves first, oldest within tier).
+        """
+        async with self.pool.acquire() as conn:
+            if kinds:
+                rows = await conn.fetch(
+                    """
+                    UPDATE public.pending_moves
+                       SET status = 'claimed',
+                           claimed_by = $1,
+                           claimed_at = NOW(),
+                           updated_at = NOW()
+                     WHERE id IN (
+                       SELECT id FROM public.pending_moves
+                        WHERE status = 'approved'
+                          AND kind = ANY($2::text[])
+                        ORDER BY priority DESC, created_at ASC
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT $3
+                     )
+                    RETURNING id, run_id, created_at, updated_at, repo, kind,
+                              title, rationale, intent, priority, move_payload,
+                              status, approved_by, approved_at, applied_at,
+                              apply_detail
+                    """,
+                    runner_id,
+                    kinds,
+                    int(limit),
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    UPDATE public.pending_moves
+                       SET status = 'claimed',
+                           claimed_by = $1,
+                           claimed_at = NOW(),
+                           updated_at = NOW()
+                     WHERE id IN (
+                       SELECT id FROM public.pending_moves
+                        WHERE status = 'approved'
+                        ORDER BY priority DESC, created_at ASC
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT $2
+                     )
+                    RETURNING id, run_id, created_at, updated_at, repo, kind,
+                              title, rationale, intent, priority, move_payload,
+                              status, approved_by, approved_at, applied_at,
+                              apply_detail
+                    """,
+                    runner_id,
+                    int(limit),
+                )
+            return [_pending_row_to_dict(r) for r in rows]
+
+    async def director_release_claim(
+        self,
+        *,
+        move_id: int,
+        runner_id: str,
+        reason: str,
+    ) -> bool:
+        """Release a claimed move back to 'approved' so another runner can
+        pick it up. Returns True iff exactly one row was updated (i.e. it
+        was actually claimed by this runner)."""
+        async with self.pool.acquire() as conn:
+            tag = await conn.execute(
+                """
+                UPDATE public.pending_moves
+                   SET status = 'approved',
+                       claimed_by = NULL,
+                       claimed_at = NULL,
+                       updated_at = NOW()
+                 WHERE id = $1
+                   AND status = 'claimed'
+                   AND claimed_by = $2
+                """,
+                int(move_id),
+                runner_id,
+            )
+            # reason is logged by the caller; we don't persist it on the row
+            # (no column for it) — kept in the signature so a future
+            # release_reason column can be wired in without API churn.
+            _ = reason
+            return tag.endswith(" 1")
+
     async def director_pending_counts(self) -> dict[str, int]:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
