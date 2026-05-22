@@ -44,3 +44,21 @@ BEGIN
     END IF;
 END
 $$;
+
+-- Backfill the Day-0 bootstrap epic (id=14) which was created before these
+-- columns existed. Safe to run multiple times -- WHERE guards against overwrite.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM public.epics WHERE id = 14 AND gh_issue_url IS NULL
+    ) THEN
+        UPDATE public.epics SET
+            gh_issue_url = 'https://github.com/lkmotto/motto-mcp-server/issues/64',
+            gh_issue_number = 64,
+            max_cost_usd = 25.00,
+            max_hours = 8,
+            status = 'active'
+        WHERE id = 14;
+    END IF;
+END
+$$;
