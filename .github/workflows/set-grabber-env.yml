@@ -1,0 +1,28 @@
+name: Set grabber env var on Northflank
+on:
+  workflow_dispatch:
+
+jobs:
+  set-env:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set MOTTO_MCP_MOUNT_DOMAIN_SERVERS on Northflank service
+        env:
+          NORTHFLANK_API_KEY: ${{ secrets.NORTHFLANK_API }}
+        run: |
+          set -euo pipefail
+          echo "Setting MOTTO_MCP_MOUNT_DOMAIN_SERVERS=1 on motto-agents/motto-mcp-server"
+          curl -fsS -X PATCH \
+            -H "Authorization: Bearer $NORTHFLANK_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{"environmentVariables":{"MOTTO_MCP_MOUNT_DOMAIN_SERVERS":{"value":"1","isSecret":false}}}' \
+            "https://api.northflank.com/v1/projects/motto-agents/services/motto-mcp-server" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print('OK:', d.get('data',{}).get('id','?'))" \
+            || echo 'PATCH failed - check API shape'
+          echo "Done. Triggering redeploy..."
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $NORTHFLANK_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{}' \
+            "https://api.northflank.com/v1/projects/motto-agents/services/motto-mcp-server/deploy" \
+            || echo 'Redeploy trigger failed - may need manual restart'
