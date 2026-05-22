@@ -787,6 +787,36 @@ def register_routes(mcp, db: Database) -> None:
 
         return JSONResponse({"intent_id": str(intent_id), "ok": True})
 
+    # -- Epics cockpit view (Day-0 bootstrap criterion 8) -----------
+
+    @mcp.custom_route("/cockpit/epics", methods=["GET"])
+    async def cockpit_epics(request: Request):
+        """Server-rendered HTML page listing active epics with droid session
+        links, GitHub Issue links, cost-so-far, last-progress timestamp,
+        and pause/kill/reprompt buttons.
+        """
+        if not cockpit_auth_ok(request):
+            return _unauth_html()
+        raise NotImplementedError("Worker F: implement /cockpit/epics HTML view")
+
+    @mcp.custom_route("/cockpit/epics/{epic_id}/pause", methods=["POST"])
+    async def cockpit_epic_pause(request: Request):
+        if not cockpit_auth_ok(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        raise NotImplementedError("Worker F: implement /cockpit/epics/pause POST")
+
+    @mcp.custom_route("/cockpit/epics/{epic_id}/kill", methods=["POST"])
+    async def cockpit_epic_kill(request: Request):
+        if not cockpit_auth_ok(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        raise NotImplementedError("Worker F: implement /cockpit/epics/kill POST")
+
+    @mcp.custom_route("/cockpit/epics/{epic_id}/reprompt", methods=["POST"])
+    async def cockpit_epic_reprompt(request: Request):
+        if not cockpit_auth_ok(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        raise NotImplementedError("Worker F: implement /cockpit/epics/reprompt POST")
+
     # ── Director approval queue (motto-director PR #41) ─────────────────
     # Surfaces public.pending_moves rows so a human can approve / reject
     # before motto-director auto-acts. Same auth as everything else.

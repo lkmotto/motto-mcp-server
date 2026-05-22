@@ -624,6 +624,112 @@ async def get_trust_scores(scope: str | None = None) -> list[dict[str, Any]]:
     return await db.get_trust_scores(scope=scope)
 
 
+# ── Epic control plane (Day-0 bootstrap, May 2026) ──────────────────────────────────────────────
+# Tools for creating, dispatching, monitoring, and controlling epics
+# through GitHub Issues + Factory droid sessions.
+
+
+@mcp.tool
+async def create_epic(
+    title: str,
+    repo_full_name: str,
+    body: str,
+    labels: list[str] | None = None,
+    success_criteria: list[str] | None = None,
+    kpi_ref: str = "",
+    max_cost_usd: float = 25.0,
+    max_hours: int = 8,
+    priority: str = "medium",
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Create a GitHub Issue with label 'epic' and insert a row into the epics
+    table linked by gh_issue_url.
+
+    Returns {epic_id, issue_url, issue_number}. Labels are auto-merged with
+    ['epic']. The body should be structured with success criteria + steps.
+    """
+    raise NotImplementedError("Worker A: implement create_epic — GH Issue creation + epics row insert")
+
+
+@mcp.tool
+async def dispatch_droid_for_epic(
+    epic_id: int,
+    prompt_override: str | None = None,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Spawn a Factory droid session with motto-mcp-server attached via HTTP
+    MCP. Locks the epic to that session via epics.factory_session_id.
+
+    Returns {session_id, status, computer_id} from Factory API.
+    """
+    raise NotImplementedError("Worker A: implement dispatch_droid_for_epic — Factory API spawn + lock")
+
+
+@mcp.tool
+async def epic_status(epic_id: int) -> dict[str, Any]:
+    """Return a JSON blob with: issue body, all issue comments, latest droid
+    session status from Factory, all fleet events tagged with this epic_id,
+    and cost-so-far estimate.
+    """
+    raise NotImplementedError("Worker B: implement epic_status — aggregate GH + Factory + fleet data")
+
+
+@mcp.tool
+async def pause_epic(epic_id: int, reason: str = "", run_id: str | None = None) -> dict[str, Any]:
+    """Pause an active epic. Sets status='paused' and posts an issue comment
+    with the pause reason.
+    """
+    raise NotImplementedError("Worker B: implement pause_epic — status update + GH comment")
+
+
+@mcp.tool
+async def kill_epic(epic_id: int, reason: str = "", run_id: str | None = None) -> dict[str, Any]:
+    """Kill/abandon an epic. Sets status='abandoned', posts a comment on the
+    linked GitHub Issue, and cancels the associated Factory session if still
+    running.
+    """
+    raise NotImplementedError("Worker B: implement kill_epic — status update + Factory cancel + GH comment")
+
+
+@mcp.tool
+async def list_all_services() -> list[dict[str, Any]]:
+    """List all services across Northflank projects, jobs, and Cloudflare
+    Workers. Returns unified list with: name, kind, last_deployed_at,
+    has_recent_runs, repo_link if discoverable.
+    """
+    raise NotImplementedError("Worker C: implement list_all_services — NF + CF API queries")
+
+
+@mcp.tool
+async def find_orphans(days_since_run: int = 30, days_since_commit: int = 60) -> list[dict[str, Any]]:
+    """Find services with no run in N days, no commit in M days, and no
+    env var consumers (via secret-group inheritance). Returns candidate list.
+    """
+    raise NotImplementedError("Worker C: implement find_orphans — cross-reference NF + CF APIs")
+
+
+@mcp.tool
+async def archive_service(
+    name: str,
+    reason: str = "",
+    confirmed: bool = False,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Archive a service. Default is dry-run (confirmation_required event).
+    Set confirmed=true to actually delete via Northflank API.
+    """
+    raise NotImplementedError("Worker C: implement archive_service — record_event + NF delete")
+
+
+@mcp.tool
+async def consolidation_audit() -> list[dict[str, Any]]:
+    """LLM-driven audit (DeepSeek V4-Flash). Reads list_all_services() +
+    repo READMEs + skill descriptions, returns clusters of duplication
+    candidates.
+    """
+    raise NotImplementedError("Worker C: implement consolidation_audit — LLM cluster analysis")
+
+
 # ── HTTP custom routes (dashboard + status JSON + healthz) ─────────────────────────────────────
 
 

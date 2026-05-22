@@ -1222,6 +1222,61 @@ class Database:
                 )
             return result.endswith(" 1")
 
+    # -- Epic control plane helpers (Day-0 bootstrap) --------------------
+
+    async def insert_epic_with_gh(
+        self,
+        *,
+        title: str,
+        repo_full_name: str,
+        body: str,
+        gh_issue_url: str,
+        gh_issue_number: int,
+        labels: list[str] | None = None,
+        success_criteria: list[str] | None = None,
+        kpi_ref: str = "",
+        max_cost_usd: float = 25.0,
+        max_hours: int = 8,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Insert a new epic row with GitHub-linked fields."""
+        raise NotImplementedError("Worker A: implement insert_epic_with_gh")
+
+    async def update_epic_session_id(
+        self, *, epic_id: int, factory_session_id: str
+    ) -> bool:
+        """Lock an epic to a Factory session."""
+        raise NotImplementedError("Worker A: implement update_epic_session_id")
+
+    async def fetch_epic_for_status(self, *, epic_id: int) -> dict[str, Any] | None:
+        """Fetch full epic row for epic_status tool."""
+        raise NotImplementedError("Worker B: implement fetch_epic_for_status")
+
+    async def set_epic_status(
+        self, *, epic_id: int, new_status: str, reason: str = ""
+    ) -> bool:
+        """Transition an epic to paused/abandoned status."""
+        raise NotImplementedError("Worker B: implement set_epic_status")
+
+    async def accrue_epic_cost(self, *, epic_id: int, cost_delta_usd: float) -> None:
+        """Add to an epic cost_so_far_usd."""
+        raise NotImplementedError("Worker D: implement accrue_epic_cost")
+
+    async def update_epic_progress(self, *, epic_id: int) -> None:
+        """Set last_progress_at = now()."""
+        raise NotImplementedError("Worker D: implement update_epic_progress")
+
+    async def list_active_epics_mcp(self) -> list[dict[str, Any]]:
+        """List epics with status active for epic_watcher polling."""
+        raise NotImplementedError("Worker D: implement list_active_epics_mcp")
+
+    async def list_northflank_services(self) -> list[dict[str, Any]]:
+        """Proxy to Northflank API for service listing."""
+        raise NotImplementedError("Worker C: implement list_northflank_services")
+
+    async def archive_northflank_service(self, *, name: str, reason: str) -> bool:
+        """Delete a Northflank service/resource."""
+        raise NotImplementedError("Worker C: implement archive_northflank_service")
     # ── Planner observability ────────────────────────────────────────────
 
     async def latest_planner_event(self) -> dict[str, Any] | None:
