@@ -508,6 +508,50 @@ async def verify_move(
 
 
 @mcp.tool
+async def claim_next_step(
+    runner_id: str,
+    kinds: list[str] | None = None,
+    limit: int = 1,
+) -> dict[str, Any]:
+    """Atomically claim the next approved pending_moves row(s) for a droid runner.
+
+    Returns {"ok": True, "claimed": [<rows>], "count": N}. Returns
+    {"ok": True, "claimed": [], "count": 0} when the queue is empty —
+    this is NOT an error, droids should poll on a backoff.
+    """
+    if not runner_id or not runner_id.strip():
+        return {"ok": False, "error": "runner_id must be non-empty"}
+    if not (1 <= int(limit) <= 10):
+        return {"ok": False, "error": "limit must be between 1 and 10"}
+    claimed = await db.director_claim_next_step(
+        runner_id=runner_id,
+        kinds=kinds,
+        limit=int(limit),
+    )
+    return {"ok": True, "claimed": claimed, "count": len(claimed)}
+
+
+@mcp.tool
+async def release_claimed_step(
+    move_id: int,
+    runner_id: str,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Release a previously-claimed move back to 'approved' so another
+    runner can pick it up. Idempotent — releasing an already-released
+    row returns ok=True with released=False.
+    """
+    if not runner_id or not runner_id.strip():
+        return {"ok": False, "error": "runner_id must be non-empty"}
+    released = await db.director_release_claim(
+        move_id=int(move_id),
+        runner_id=runner_id,
+        reason=reason,
+    )
+    return {"ok": True, "released": released}
+
+
+@mcp.tool
 async def list_verifications(
     move_id: int | None = None,
     repo: str | None = None,
