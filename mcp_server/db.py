@@ -1249,14 +1249,139 @@ class Database:
         raise NotImplementedError("Worker A: implement update_epic_session_id")
 
     async def fetch_epic_for_status(self, *, epic_id: int) -> dict[str, Any] | None:
-        """Fetch full epic row for epic_status tool."""
-        raise NotImplementedError("Worker B: implement fetch_epic_for_status")
+        """Fetch the full epic row (every column from migration 0007) for
+        the epic_status MCP tool.
+
+        Returns None when the epic id does not exist. Numeric columns are
+        cast to float and timestamps to ISO-8601 so the result is JSON-safe.
+        plan is JSON-decoded when stored as a string (older rows).
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, run_id, title, kpi_ref, rationale,
+                       estimated_cycles, success_criteria, plan,
+                       status, approved_by, approved_at,
+                       closed_at, closed_reason,
+                       created_at, updated_at,
+                       gh_issue_url, gh_issue_number, factory_session_id,
+                       cost_so_far_usd, max_cost_usd, max_hours,
+                       success_criteria_json, last_progress_at
+                FROM public.epics
+                WHERE id = $1
+                """,
+                int(epic_id),
+            )
+            if row is None:
+                return None
+            d = dict(row)
+            plan = d.get("plan")
+            if isinstance(plan, str):
+                try:
+                    d["plan"] = json.loads(plan)
+                except (ValueError, TypeError):
+                    d["plan"] = []
+            sc = d.get("success_criteria_json")
+            if isinstance(sc, str):
+                try:
+                    d["success_criteria_json"] = json.loads(sc)
+                except (ValueError, TypeError):
+                    d["success_criteria_json"] = None
+            for k in (
+                "created_at", "updated_at",
+                "approved_at", "closed_at", "last_progress_at",
+            ):
+                v = d.get(k)
+                if v is not None:
+                    d[k] = v.isoformat()
+            for k in ("cost_so_far_usd", "max_cost_usd"):
+                v = d.get(k)
+                if v is not None:
+                    try:
+                        d[k] = float(v)
+                    except (TypeError, ValueError):
+                        d[k] = None
+            return d
 
     async def set_epic_status(
         self, *, epic_id: int, new_status: str, reason: str = ""
     ) -> bool:
-        """Transition an epic to paused/abandoned status."""
-        raise NotImplementedError("Worker B: implement set_epic_status")
+        """Transition an epic to a Worker-B paused / abandoned state.
+
+        Allowed: 'paused' | 'abandoned'. pause_epic + kill_epic call this.
+        For 'abandoned' we also stamp closed_at + closed_reason so the
+        cockpit's closed-epic filter picks the row up. The underlying CHECK
+        constraint on public.epics (see motto-director's 0006_epics.sql)
+        only permits the canonical lifecycle statuses, so the kill_epic
+        path lands as 'abandoned' even though the tool is named kill_epic.
+        """
+        if new_status not in ("paused", "abandoned"):
+            return False
+        async with self.pool.acquire() as conn:
+            if new_status == "abandoned":
+                result = await conn.execute(
+                    """
+                    UPDATE public.epics
+                    SET status = 'abandoned',
+                        closed_at = NOW(),
+                        closed_reason = $2,
+                        updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    int(epic_id), reason or "",
+                )
+            else:
+                result = await conn.execute(
+                    """
+                    UPDATE public.epics
+                    SET status = 'paused',
+                        updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    int(epic_id),
+                )
+            return result.endswith(" 1")
+
+    async def events_for_epic_run(
+        self, *, run_id: str, limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Recent fleet.events newest-first whose run_id matches the epic
+        row's run_id. Returns [] when run_id is None or malformed.
+
+        Used by the epic_status MCP tool to surface what droids are actually
+        doing for this epic without re-fetching from Factory.
+        """
+        if not run_id:
+            return []
+        try:
+            rid = UUID(str(run_id))
+        except (ValueError, TypeError, AttributeError):
+            return []
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT e.id, e.ts, e.level, e.kind, e.payload,
+                       a.name AS agent_name, e.run_id
+                FROM fleet.events e
+                JOIN fleet.agents a ON a.id = e.agent_id
+                WHERE e.run_id = $1
+                ORDER BY e.ts DESC
+                LIMIT $2
+                """,
+                rid, int(limit),
+            )
+            return [
+                {
+                    "id": r["id"],
+                    "ts": r["ts"].isoformat(),
+                    "level": r["level"],
+                    "kind": r["kind"],
+                    "payload": r["payload"],
+                    "agent_name": r["agent_name"],
+                    "run_id": str(r["run_id"]) if r["run_id"] else None,
+                }
+                for r in rows
+            ]
 
     async def accrue_epic_cost(self, *, epic_id: int, cost_delta_usd: float) -> None:
         """Add to an epic cost_so_far_usd."""
