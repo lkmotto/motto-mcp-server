@@ -144,6 +144,14 @@ async def record_run_end(
     """Close a fleet run. status is 'success' / 'error' / 'cancelled'."""
     if status not in ("success", "error", "cancelled"):
         raise ValueError("status must be success / error / cancelled")
+    try:
+        from uuid import UUID as _UUID
+        _UUID(run_id)
+    except (ValueError, AttributeError) as exc:
+        raise ValueError(
+            f"record_run_end: run_id {run_id!r} is not a valid UUID. "
+            "Pass the run_id returned by record_run_start."
+        ) from exc
     await db.end_run(run_id=run_id, status=status, summary=summary or {})
     return {"ok": True}
 
