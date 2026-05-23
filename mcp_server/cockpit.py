@@ -65,6 +65,258 @@ def _unauth_html() -> HTMLResponse:
     )
 
 
+# ── Epic cockpit helpers (Worker F) ───────────────────────────────────────────
+
+
+_GITHUB_API_BASE = "https://api.github.com"
+_FACTORY_API_BASE = os.environ.get(
+    "FACTORY_API_BASE", "https://app.factory.ai/api"
+).rstrip("/")
+_FACTORY_TIMEOUT_S = float(os.environ.get("FACTORY_TIMEOUT_S", "30"))
+
+
+def _github_token() -> str | None:
+    return os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+
+
+def _factory_token() -> str | None:
+    return (
+        os.environ.get("FACTORY_API_KEY")
+        or os.environ.get("FACTORY_TOKEN")
+        or os.environ.get("FACTORY_API_TOKEN")
+    )
+
+
+def _repo_from_gh_url(url: str | None) -> tuple[str | None, int | None]:
+    """Pull (owner/repo, issue_number) out of a GH issue URL."""
+    if not url:
+        return (None, None)
+    try:
+        u = url.split("github.com/", 1)[-1]
+        parts = u.strip("/").split("/")
+        if len(parts) >= 4 and parts[2] == "issues":
+            return (f"{parts[0]}/{parts[1]}", int(parts[3]))
+    except (ValueError, IndexError):
+        return (None, None)
+    return (None, None)
+
+
+async def _fetch_gh_for_epic(epic: dict[str, Any]) -> dict[str, Any]:
+    """Best-effort fetch of issue body, last 30 comments, and sub-issues
+    for the epic's linked GitHub issue. Any failure is captured in
+    `errors` so the detail page still renders the local DB content."""
+    out: dict[str, Any] = {
+        "issue": None,
+        "comments": [],
+        "sub_issues": [],
+        "errors": [],
+    }
+    repo, number = _repo_from_gh_url(epic.get("gh_issue_url"))
+    if not repo or not number:
+        out["errors"].append("gh_issue_url missing or unparseable")
+        return out
+    tok = _github_token()
+    if not tok:
+        out["errors"].append("GITHUB_TOKEN not configured; skipping gh fetches")
+        return out
+    headers = {
+        "Authorization": f"Bearer {tok}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    base = f"{_GITHUB_API_BASE}/repos/{repo}/issues/{number}"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            issue_resp = await client.get(base, headers=headers)
+            if issue_resp.status_code == 200:
+                out["issue"] = issue_resp.json()
+            else:
+                out["errors"].append(
+                    f"issue {issue_resp.status_code}: {issue_resp.text[:200]}"
+                )
+
+            comments_resp = await client.get(
+                f"{base}/comments",
+                headers=headers,
+                params={"per_page": 30},
+            )
+            if comments_resp.status_code == 200:
+                payload = comments_resp.json() or []
+                payload.sort(
+                    key=lambda c: c.get("created_at") or "", reverse=True
+                )
+                out["comments"] = payload[:30]
+            else:
+                out["errors"].append(
+                    f"comments {comments_resp.status_code}: "
+                    f"{comments_resp.text[:200]}"
+                )
+
+            sub_resp = await client.get(
+                f"{base}/sub_issues",
+                headers={**headers, "Accept": "application/vnd.github+json"},
+            )
+            if sub_resp.status_code == 200:
+                out["sub_issues"] = sub_resp.json() or []
+            elif sub_resp.status_code not in (404, 410, 422):
+                out["errors"].append(
+                    f"sub_issues {sub_resp.status_code}: "
+                    f"{sub_resp.text[:200]}"
+                )
+    except httpx.HTTPError as exc:
+        out["errors"].append(f"github transport: {exc}")
+    return out
+
+
+async def _invoke_epic_transition(
+    *,
+    db: Database,
+    epic_id: int,
+    kind: str,
+    new_status: str,
+    reason: str,
+    approver: str,
+) -> dict[str, Any]:
+    """Pause or kill an epic. Tries the MCP tool first so the canonical
+    side-effects (GH comment, Factory cancel) run if Worker B's
+    implementation is live; falls back to a direct DB transition so the
+    cockpit button still works on Day-0 while the tools are stubs."""
+    tool_fn = None
+    try:
+        from .tools import epics as _epics_mod  # type: ignore
+
+        tool_fn = getattr(
+            _epics_mod,
+            "pause_epic" if kind == "pause" else "kill_epic",
+            None,
+        )
+    except Exception:
+        tool_fn = None
+
+    tool_result: Any = None
+    tool_error: str | None = None
+    if tool_fn is not None:
+        try:
+            tool_result = await tool_fn(epic_id=epic_id, reason=reason)
+        except NotImplementedError as exc:
+            tool_error = f"mcp tool stub: {exc}"
+        except TypeError:
+            try:
+                tool_result = await tool_fn(epic_id, reason)
+            except NotImplementedError as exc:
+                tool_error = f"mcp tool stub: {exc}"
+            except Exception as exc:
+                tool_error = f"mcp tool error: {exc}"
+        except Exception as exc:
+            tool_error = f"mcp tool error: {exc}"
+
+    if tool_result is not None and not tool_error:
+        try:
+            await db.record_event(
+                agent_name="cockpit",
+                kind=f"epic.{kind}",
+                payload={
+                    "epic_id": epic_id,
+                    "approver": approver,
+                    "reason": reason,
+                    "via": "mcp_tool",
+                },
+                level="info",
+            )
+        except Exception:
+            logger.exception("epic transition event record failed")
+        return {"ok": True, "via": "mcp_tool", "result": tool_result}
+
+    try:
+        ok = await db.director_set_epic_status(
+            epic_id=epic_id,
+            new_status=new_status,
+            approved_by=approver,
+            closed_reason=reason,
+        )
+    except Exception as exc:
+        logger.exception("epic transition fallback failed")
+        return {"ok": False, "error": str(exc), "tool_error": tool_error}
+
+    try:
+        await db.record_event(
+            agent_name="cockpit",
+            kind=f"epic.{kind}",
+            payload={
+                "epic_id": epic_id,
+                "approver": approver,
+                "reason": reason,
+                "via": "db_fallback",
+                "tool_error": tool_error,
+            },
+            level="info",
+        )
+    except Exception:
+        logger.exception("epic transition event record failed")
+
+    return {
+        "ok": bool(ok),
+        "via": "db_fallback",
+        "tool_error": tool_error,
+        "new_status": new_status,
+    }
+
+
+async def _message_factory_droid(
+    *, session_id: str, message: str, sender: str
+) -> dict[str, Any]:
+    """POST a reprompt message into a Factory droid session."""
+    tok = _factory_token()
+    if not tok:
+        return {
+            "ok": False,
+            "error": (
+                "FACTORY_API_KEY not configured on server; "
+                "set FACTORY_API_KEY (and optionally FACTORY_API_BASE) "
+                "to enable reprompt"
+            ),
+            "session_id": session_id,
+        }
+    url = f"{_FACTORY_API_BASE}/sessions/{session_id}/messages"
+    headers = {
+        "Authorization": f"Bearer {tok}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    body = {
+        "role": "user",
+        "content": message,
+        "source": "motto-cockpit",
+        "sender": sender,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=_FACTORY_TIMEOUT_S) as client:
+            resp = await client.post(url, headers=headers, json=body)
+    except httpx.HTTPError as exc:
+        return {
+            "ok": False,
+            "error": f"factory transport: {exc}",
+            "session_id": session_id,
+        }
+    if 200 <= resp.status_code < 300:
+        try:
+            data: Any = resp.json()
+        except (ValueError, json.JSONDecodeError):
+            data = {"raw": resp.text[:500]}
+        return {
+            "ok": True,
+            "session_id": session_id,
+            "status_code": resp.status_code,
+            "response": data,
+        }
+    return {
+        "ok": False,
+        "error": f"factory api HTTP {resp.status_code}",
+        "session_id": session_id,
+        "detail": resp.text[:500],
+    }
+
+
 # ── Director chat (DeepSeek + tools) ──────────────────────────────────────────
 
 DIRECTOR_PERSONA = (
@@ -787,37 +1039,194 @@ def register_routes(mcp, db: Database) -> None:
 
         return JSONResponse({"intent_id": str(intent_id), "ok": True})
 
-    # -- Epics cockpit view (Day-0 bootstrap criterion 8) -----------
+    # -- Epics cockpit view (Day-0 bootstrap criterion 8, Worker F) ----------
+    # Cockpit pages for the epic control plane: list every epic in Neon plus
+    # a detail page that aggregates GitHub issue body/comments/sub-issues,
+    # fleet events for the parent run, and the worker-swarm membership.
+    # Pause/kill route the action through the MCP tools layer so the same
+    # invariants apply whether the trigger is human-in-cockpit or another
+    # agent. Reprompt POSTs into Factory's message API for the locked
+    # session so a human can nudge a running droid mid-epic.
 
     @mcp.custom_route("/cockpit/epics", methods=["GET"])
     async def cockpit_epics(request: Request):
-        """STUB -- Worker F implements list view of all epics. See Issue #64 criterion 8."""
         if not cockpit_auth_ok(request):
             return _unauth_html()
         token = request.query_params.get("token", "")
+        status_filter = request.query_params.get("status") or "all"
+        try:
+            limit = int(request.query_params.get("limit") or 100)
+        except ValueError:
+            limit = 100
+        try:
+            epics = await db.list_epics_full(
+                status=None if status_filter == "all" else status_filter,
+                limit=min(limit, 500),
+            )
+            counts = await db.director_epic_counts()
+        except Exception as exc:
+            logger.exception("cockpit_epics list failed")
+            return HTMLResponse(
+                f"<h1>error loading epics</h1><pre>{h(str(exc))}</pre>",
+                status_code=500,
+            )
         return HTMLResponse(
-            '<h1>Epics cockpit view</h1><p>Worker F stub -- list view coming soon.</p>'
-            '<p><a href="/cockpit">Back to cockpit</a></p>',
-            status_code=200,
+            _render_epics_list(token, epics, counts, status_filter)
+        )
+
+    @mcp.custom_route("/cockpit/epics/{epic_id}", methods=["GET"])
+    async def cockpit_epic_detail(request: Request):
+        if not cockpit_auth_ok(request):
+            return _unauth_html()
+        token = request.query_params.get("token", "")
+        try:
+            epic_id = int(request.path_params.get("epic_id"))
+        except (TypeError, ValueError):
+            return HTMLResponse("<h1>bad epic id</h1>", status_code=400)
+        try:
+            epic = await db.get_epic_full(epic_id=epic_id)
+        except Exception as exc:
+            logger.exception("cockpit_epic_detail db failed")
+            return HTMLResponse(
+                f"<h1>error</h1><pre>{h(str(exc))}</pre>",
+                status_code=500,
+            )
+        if not epic:
+            return HTMLResponse(
+                f"<h1>epic {h(str(epic_id))} not found</h1>"
+                f'<p><a href="/cockpit/epics?token={h(token)}">back</a></p>',
+                status_code=404,
+            )
+        run_id = epic.get("run_id")
+        events = (
+            await db.events_for_run(run_id=run_id, limit=100)
+            if run_id else []
+        )
+        swarm = (
+            await db.swarm_for_run(run_id=run_id, limit=50)
+            if run_id else []
+        )
+        gh_data = await _fetch_gh_for_epic(epic)
+        return HTMLResponse(
+            _render_epic_detail(token, epic, events, swarm, gh_data)
         )
 
     @mcp.custom_route("/cockpit/epics/{epic_id}/pause", methods=["POST"])
     async def cockpit_epic_pause(request: Request):
         if not cockpit_auth_ok(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        return JSONResponse({"ok": False, "stub": True, "message": "Worker F stub"}, status_code=501)
+        try:
+            epic_id = int(request.path_params.get("epic_id"))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "bad epic id"}, status_code=400)
+        reason = ""
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                reason = str(body.get("reason") or "")
+        except Exception:
+            pass
+        result = await _invoke_epic_transition(
+            db=db,
+            epic_id=epic_id,
+            kind="pause",
+            new_status="paused",
+            reason=reason,
+            approver=_approver_id(request),
+        )
+        status_code = 200 if result.get("ok") else 500
+        return JSONResponse(result, status_code=status_code)
 
     @mcp.custom_route("/cockpit/epics/{epic_id}/kill", methods=["POST"])
     async def cockpit_epic_kill(request: Request):
         if not cockpit_auth_ok(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        return JSONResponse({"ok": False, "stub": True, "message": "Worker F stub"}, status_code=501)
+        try:
+            epic_id = int(request.path_params.get("epic_id"))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "bad epic id"}, status_code=400)
+        reason = ""
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                reason = str(body.get("reason") or "")
+        except Exception:
+            pass
+        result = await _invoke_epic_transition(
+            db=db,
+            epic_id=epic_id,
+            kind="kill",
+            new_status="abandoned",
+            reason=reason,
+            approver=_approver_id(request),
+        )
+        status_code = 200 if result.get("ok") else 500
+        return JSONResponse(result, status_code=status_code)
 
     @mcp.custom_route("/cockpit/epics/{epic_id}/reprompt", methods=["POST"])
     async def cockpit_epic_reprompt(request: Request):
         if not cockpit_auth_ok(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        return JSONResponse({"ok": False, "stub": True, "message": "Worker F stub"}, status_code=501)
+        try:
+            epic_id = int(request.path_params.get("epic_id"))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "bad epic id"}, status_code=400)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid json"}, status_code=400)
+        message = ""
+        if isinstance(body, dict):
+            message = str(
+                body.get("message")
+                or body.get("prompt")
+                or body.get("text")
+                or ""
+            ).strip()
+        if not message:
+            return JSONResponse(
+                {"error": "message body required"}, status_code=400
+            )
+        try:
+            epic = await db.get_epic_full(epic_id=epic_id)
+        except Exception as exc:
+            logger.exception("cockpit_epic_reprompt db failed")
+            return JSONResponse({"error": str(exc)}, status_code=500)
+        if not epic:
+            return JSONResponse({"error": "epic not found"}, status_code=404)
+        session_id = epic.get("factory_session_id")
+        if not session_id:
+            return JSONResponse(
+                {
+                    "error": (
+                        "epic has no factory_session_id; "
+                        "dispatch a droid first"
+                    )
+                },
+                status_code=409,
+            )
+        result = await _message_factory_droid(
+            session_id=str(session_id),
+            message=message,
+            sender=_approver_id(request),
+        )
+        try:
+            await db.record_event(
+                agent_name="cockpit",
+                kind="epic.reprompt",
+                payload={
+                    "epic_id": epic_id,
+                    "factory_session_id": session_id,
+                    "sender": _approver_id(request),
+                    "message": message[:200],
+                    "factory_ok": bool(result.get("ok")),
+                },
+                level="info",
+            )
+        except Exception:
+            logger.exception("epic.reprompt event record failed")
+        status_code = 200 if result.get("ok") else 502
+        return JSONResponse(result, status_code=status_code)
 
     # ── Director approval queue (motto-director PR #41) ─────────────────
     # Surfaces public.pending_moves rows so a human can approve / reject
