@@ -85,7 +85,7 @@ mcp = FastMCP(
         "and post cross-agent intents. motto-director consumes via "
         "get_fleet_status / get_recent_events."
     ),
-    auth=_mcp_auth(),
+
     lifespan=_lifespan,
 )
 
