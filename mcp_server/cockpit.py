@@ -65,6 +65,258 @@ def _unauth_html() -> HTMLResponse:
     )
 
 
+# ── Epic cockpit helpers (Worker F) ───────────────────────────────────────────
+
+
+_GITHUB_API_BASE = "https://api.github.com"
+_FACTORY_API_BASE = os.environ.get(
+    "FACTORY_API_BASE", "https://app.factory.ai/api"
+).rstrip("/")
+_FACTORY_TIMEOUT_S = float(os.environ.get("FACTORY_TIMEOUT_S", "30"))
+
+
+def _github_token() -> str | None:
+    return os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+
+
+def _factory_token() -> str | None:
+    return (
+        os.environ.get("FACTORY_API_KEY")
+        or os.environ.get("FACTORY_TOKEN")
+        or os.environ.get("FACTORY_API_TOKEN")
+    )
+
+
+def _repo_from_gh_url(url: str | None) -> tuple[str | None, int | None]:
+    """Pull (owner/repo, issue_number) out of a GH issue URL."""
+    if not url:
+        return (None, None)
+    try:
+        u = url.split("github.com/", 1)[-1]
+        parts = u.strip("/").split("/")
+        if len(parts) >= 4 and parts[2] == "issues":
+            return (f"{parts[0]}/{parts[1]}", int(parts[3]))
+    except (ValueError, IndexError):
+        return (None, None)
+    return (None, None)
+
+
+async def _fetch_gh_for_epic(epic: dict[str, Any]) -> dict[str, Any]:
+    """Best-effort fetch of issue body, last 30 comments, and sub-issues
+    for the epic's linked GitHub issue. Any failure is captured in
+    `errors` so the detail page still renders the local DB content."""
+    out: dict[str, Any] = {
+        "issue": None,
+        "comments": [],
+        "sub_issues": [],
+        "errors": [],
+    }
+    repo, number = _repo_from_gh_url(epic.get("gh_issue_url"))
+    if not repo or not number:
+        out["errors"].append("gh_issue_url missing or unparseable")
+        return out
+    tok = _github_token()
+    if not tok:
+        out["errors"].append("GITHUB_TOKEN not configured; skipping gh fetches")
+        return out
+    headers = {
+        "Authorization": f"Bearer {tok}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    base = f"{_GITHUB_API_BASE}/repos/{repo}/issues/{number}"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            issue_resp = await client.get(base, headers=headers)
+            if issue_resp.status_code == 200:
+                out["issue"] = issue_resp.json()
+            else:
+                out["errors"].append(
+                    f"issue {issue_resp.status_code}: {issue_resp.text[:200]}"
+                )
+
+            comments_resp = await client.get(
+                f"{base}/comments",
+                headers=headers,
+                params={"per_page": 30},
+            )
+            if comments_resp.status_code == 200:
+                payload = comments_resp.json() or []
+                payload.sort(
+                    key=lambda c: c.get("created_at") or "", reverse=True
+                )
+                out["comments"] = payload[:30]
+            else:
+                out["errors"].append(
+                    f"comments {comments_resp.status_code}: "
+                    f"{comments_resp.text[:200]}"
+                )
+
+            sub_resp = await client.get(
+                f"{base}/sub_issues",
+                headers={**headers, "Accept": "application/vnd.github+json"},
+            )
+            if sub_resp.status_code == 200:
+                out["sub_issues"] = sub_resp.json() or []
+            elif sub_resp.status_code not in (404, 410, 422):
+                out["errors"].append(
+                    f"sub_issues {sub_resp.status_code}: "
+                    f"{sub_resp.text[:200]}"
+                )
+    except httpx.HTTPError as exc:
+        out["errors"].append(f"github transport: {exc}")
+    return out
+
+
+async def _invoke_epic_transition(
+    *,
+    db: Database,
+    epic_id: int,
+    kind: str,
+    new_status: str,
+    reason: str,
+    approver: str,
+) -> dict[str, Any]:
+    """Pause or kill an epic. Tries the MCP tool first so the canonical
+    side-effects (GH comment, Factory cancel) run if Worker B's
+    implementation is live; falls back to a direct DB transition so the
+    cockpit button still works on Day-0 while the tools are stubs."""
+    tool_fn = None
+    try:
+        from .tools import epics as _epics_mod  # type: ignore
+
+        tool_fn = getattr(
+            _epics_mod,
+            "pause_epic" if kind == "pause" else "kill_epic",
+            None,
+        )
+    except Exception:
+        tool_fn = None
+
+    tool_result: Any = None
+    tool_error: str | None = None
+    if tool_fn is not None:
+        try:
+            tool_result = await tool_fn(epic_id=epic_id, reason=reason)
+        except NotImplementedError as exc:
+            tool_error = f"mcp tool stub: {exc}"
+        except TypeError:
+            try:
+                tool_result = await tool_fn(epic_id, reason)
+            except NotImplementedError as exc:
+                tool_error = f"mcp tool stub: {exc}"
+            except Exception as exc:
+                tool_error = f"mcp tool error: {exc}"
+        except Exception as exc:
+            tool_error = f"mcp tool error: {exc}"
+
+    if tool_result is not None and not tool_error:
+        try:
+            await db.record_event(
+                agent_name="cockpit",
+                kind=f"epic.{kind}",
+                payload={
+                    "epic_id": epic_id,
+                    "approver": approver,
+                    "reason": reason,
+                    "via": "mcp_tool",
+                },
+                level="info",
+            )
+        except Exception:
+            logger.exception("epic transition event record failed")
+        return {"ok": True, "via": "mcp_tool", "result": tool_result}
+
+    try:
+        ok = await db.director_set_epic_status(
+            epic_id=epic_id,
+            new_status=new_status,
+            approved_by=approver,
+            closed_reason=reason,
+        )
+    except Exception as exc:
+        logger.exception("epic transition fallback failed")
+        return {"ok": False, "error": str(exc), "tool_error": tool_error}
+
+    try:
+        await db.record_event(
+            agent_name="cockpit",
+            kind=f"epic.{kind}",
+            payload={
+                "epic_id": epic_id,
+                "approver": approver,
+                "reason": reason,
+                "via": "db_fallback",
+                "tool_error": tool_error,
+            },
+            level="info",
+        )
+    except Exception:
+        logger.exception("epic transition event record failed")
+
+    return {
+        "ok": bool(ok),
+        "via": "db_fallback",
+        "tool_error": tool_error,
+        "new_status": new_status,
+    }
+
+
+async def _message_factory_droid(
+    *, session_id: str, message: str, sender: str
+) -> dict[str, Any]:
+    """POST a reprompt message into a Factory droid session."""
+    tok = _factory_token()
+    if not tok:
+        return {
+            "ok": False,
+            "error": (
+                "FACTORY_API_KEY not configured on server; "
+                "set FACTORY_API_KEY (and optionally FACTORY_API_BASE) "
+                "to enable reprompt"
+            ),
+            "session_id": session_id,
+        }
+    url = f"{_FACTORY_API_BASE}/sessions/{session_id}/messages"
+    headers = {
+        "Authorization": f"Bearer {tok}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    body = {
+        "role": "user",
+        "content": message,
+        "source": "motto-cockpit",
+        "sender": sender,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=_FACTORY_TIMEOUT_S) as client:
+            resp = await client.post(url, headers=headers, json=body)
+    except httpx.HTTPError as exc:
+        return {
+            "ok": False,
+            "error": f"factory transport: {exc}",
+            "session_id": session_id,
+        }
+    if 200 <= resp.status_code < 300:
+        try:
+            data: Any = resp.json()
+        except (ValueError, json.JSONDecodeError):
+            data = {"raw": resp.text[:500]}
+        return {
+            "ok": True,
+            "session_id": session_id,
+            "status_code": resp.status_code,
+            "response": data,
+        }
+    return {
+        "ok": False,
+        "error": f"factory api HTTP {resp.status_code}",
+        "session_id": session_id,
+        "detail": resp.text[:500],
+    }
+
+
 # ── Director chat (DeepSeek + tools) ──────────────────────────────────────────
 
 DIRECTOR_PERSONA = (
@@ -787,37 +1039,194 @@ def register_routes(mcp, db: Database) -> None:
 
         return JSONResponse({"intent_id": str(intent_id), "ok": True})
 
-    # -- Epics cockpit view (Day-0 bootstrap criterion 8) -----------
+    # -- Epics cockpit view (Day-0 bootstrap criterion 8, Worker F) ----------
+    # Cockpit pages for the epic control plane: list every epic in Neon plus
+    # a detail page that aggregates GitHub issue body/comments/sub-issues,
+    # fleet events for the parent run, and the worker-swarm membership.
+    # Pause/kill route the action through the MCP tools layer so the same
+    # invariants apply whether the trigger is human-in-cockpit or another
+    # agent. Reprompt POSTs into Factory's message API for the locked
+    # session so a human can nudge a running droid mid-epic.
 
     @mcp.custom_route("/cockpit/epics", methods=["GET"])
     async def cockpit_epics(request: Request):
-        """STUB -- Worker F implements list view of all epics. See Issue #64 criterion 8."""
         if not cockpit_auth_ok(request):
             return _unauth_html()
         token = request.query_params.get("token", "")
+        status_filter = request.query_params.get("status") or "all"
+        try:
+            limit = int(request.query_params.get("limit") or 100)
+        except ValueError:
+            limit = 100
+        try:
+            epics = await db.list_epics_full(
+                status=None if status_filter == "all" else status_filter,
+                limit=min(limit, 500),
+            )
+            counts = await db.director_epic_counts()
+        except Exception as exc:
+            logger.exception("cockpit_epics list failed")
+            return HTMLResponse(
+                f"<h1>error loading epics</h1><pre>{h(str(exc))}</pre>",
+                status_code=500,
+            )
         return HTMLResponse(
-            '<h1>Epics cockpit view</h1><p>Worker F stub -- list view coming soon.</p>'
-            '<p><a href="/cockpit">Back to cockpit</a></p>',
-            status_code=200,
+            _render_epics_list(token, epics, counts, status_filter)
+        )
+
+    @mcp.custom_route("/cockpit/epics/{epic_id}", methods=["GET"])
+    async def cockpit_epic_detail(request: Request):
+        if not cockpit_auth_ok(request):
+            return _unauth_html()
+        token = request.query_params.get("token", "")
+        try:
+            epic_id = int(request.path_params.get("epic_id"))
+        except (TypeError, ValueError):
+            return HTMLResponse("<h1>bad epic id</h1>", status_code=400)
+        try:
+            epic = await db.get_epic_full(epic_id=epic_id)
+        except Exception as exc:
+            logger.exception("cockpit_epic_detail db failed")
+            return HTMLResponse(
+                f"<h1>error</h1><pre>{h(str(exc))}</pre>",
+                status_code=500,
+            )
+        if not epic:
+            return HTMLResponse(
+                f"<h1>epic {h(str(epic_id))} not found</h1>"
+                f'<p><a href="/cockpit/epics?token={h(token)}">back</a></p>',
+                status_code=404,
+            )
+        run_id = epic.get("run_id")
+        events = (
+            await db.events_for_run(run_id=run_id, limit=100)
+            if run_id else []
+        )
+        swarm = (
+            await db.swarm_for_run(run_id=run_id, limit=50)
+            if run_id else []
+        )
+        gh_data = await _fetch_gh_for_epic(epic)
+        return HTMLResponse(
+            _render_epic_detail(token, epic, events, swarm, gh_data)
         )
 
     @mcp.custom_route("/cockpit/epics/{epic_id}/pause", methods=["POST"])
     async def cockpit_epic_pause(request: Request):
         if not cockpit_auth_ok(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        return JSONResponse({"ok": False, "stub": True, "message": "Worker F stub"}, status_code=501)
+        try:
+            epic_id = int(request.path_params.get("epic_id"))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "bad epic id"}, status_code=400)
+        reason = ""
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                reason = str(body.get("reason") or "")
+        except Exception:
+            pass
+        result = await _invoke_epic_transition(
+            db=db,
+            epic_id=epic_id,
+            kind="pause",
+            new_status="paused",
+            reason=reason,
+            approver=_approver_id(request),
+        )
+        status_code = 200 if result.get("ok") else 500
+        return JSONResponse(result, status_code=status_code)
 
     @mcp.custom_route("/cockpit/epics/{epic_id}/kill", methods=["POST"])
     async def cockpit_epic_kill(request: Request):
         if not cockpit_auth_ok(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        return JSONResponse({"ok": False, "stub": True, "message": "Worker F stub"}, status_code=501)
+        try:
+            epic_id = int(request.path_params.get("epic_id"))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "bad epic id"}, status_code=400)
+        reason = ""
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                reason = str(body.get("reason") or "")
+        except Exception:
+            pass
+        result = await _invoke_epic_transition(
+            db=db,
+            epic_id=epic_id,
+            kind="kill",
+            new_status="abandoned",
+            reason=reason,
+            approver=_approver_id(request),
+        )
+        status_code = 200 if result.get("ok") else 500
+        return JSONResponse(result, status_code=status_code)
 
     @mcp.custom_route("/cockpit/epics/{epic_id}/reprompt", methods=["POST"])
     async def cockpit_epic_reprompt(request: Request):
         if not cockpit_auth_ok(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        return JSONResponse({"ok": False, "stub": True, "message": "Worker F stub"}, status_code=501)
+        try:
+            epic_id = int(request.path_params.get("epic_id"))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "bad epic id"}, status_code=400)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid json"}, status_code=400)
+        message = ""
+        if isinstance(body, dict):
+            message = str(
+                body.get("message")
+                or body.get("prompt")
+                or body.get("text")
+                or ""
+            ).strip()
+        if not message:
+            return JSONResponse(
+                {"error": "message body required"}, status_code=400
+            )
+        try:
+            epic = await db.get_epic_full(epic_id=epic_id)
+        except Exception as exc:
+            logger.exception("cockpit_epic_reprompt db failed")
+            return JSONResponse({"error": str(exc)}, status_code=500)
+        if not epic:
+            return JSONResponse({"error": "epic not found"}, status_code=404)
+        session_id = epic.get("factory_session_id")
+        if not session_id:
+            return JSONResponse(
+                {
+                    "error": (
+                        "epic has no factory_session_id; "
+                        "dispatch a droid first"
+                    )
+                },
+                status_code=409,
+            )
+        result = await _message_factory_droid(
+            session_id=str(session_id),
+            message=message,
+            sender=_approver_id(request),
+        )
+        try:
+            await db.record_event(
+                agent_name="cockpit",
+                kind="epic.reprompt",
+                payload={
+                    "epic_id": epic_id,
+                    "factory_session_id": session_id,
+                    "sender": _approver_id(request),
+                    "message": message[:200],
+                    "factory_ok": bool(result.get("ok")),
+                },
+                level="info",
+            )
+        except Exception:
+            logger.exception("epic.reprompt event record failed")
+        status_code = 200 if result.get("ok") else 502
+        return JSONResponse(result, status_code=status_code)
 
     # ── Director approval queue (motto-director PR #41) ─────────────────
     # Surfaces public.pending_moves rows so a human can approve / reject
@@ -1807,5 +2216,714 @@ document.getElementById("status-filter").addEventListener("change", refresh);
 
 refresh();
 setInterval(refresh, 15000);
+</script>
+</body></html>"""
+
+
+# ── Epic cockpit renderers (Worker F) ─────────────────────────────────────────
+
+
+_EPIC_STATUSES = ("proposed", "active", "paused", "closed", "abandoned")
+
+
+def _fmt_money(v: Any) -> str:
+    if v is None:
+        return "—"
+    try:
+        return f"${float(v):.2f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _fmt_iso_short(ts: str | None) -> str:
+    if not ts:
+        return "—"
+    s = str(ts).replace("T", " ")
+    if "." in s:
+        s = s.split(".", 1)[0]
+    return s[:19]
+
+
+def _epic_progress_pct(epic: dict[str, Any]) -> int:
+    """Best-effort progress %: ratio of done items in success_criteria_json
+    if present; otherwise 0/100 derived from epic status."""
+    sc = epic.get("success_criteria_json")
+    if isinstance(sc, list) and sc:
+        total = len(sc)
+        done = 0
+        for item in sc:
+            if not isinstance(item, dict):
+                continue
+            status = str(item.get("status") or item.get("state") or "").lower()
+            if status in ("done", "passed", "complete", "completed", "closed"):
+                done += 1
+        if total:
+            return int(round((done / total) * 100))
+    status = (epic.get("status") or "").lower()
+    if status == "closed":
+        return 100
+    if status == "abandoned":
+        return 100
+    if status == "active":
+        return 25
+    if status == "paused":
+        return 50
+    return 0
+
+
+def _factory_session_link(session_id: str | None) -> str:
+    if not session_id:
+        return "—"
+    sid = h(str(session_id))
+    href = f"https://app.factory.ai/sessions/{sid}"
+    return (
+        f'<a href="{href}" target="_blank" rel="noopener" '
+        f'class="accent">{sid[:8]}…</a>'
+    )
+
+
+def _epic_status_badge(status: str | None) -> str:
+    s = (status or "unknown").lower()
+    return f'<span class="badge badge-{h(s)}">{h(s)}</span>'
+
+
+def _render_epics_list(
+    token: str,
+    epics: list[dict[str, Any]],
+    counts: dict[str, int],
+    status_filter: str,
+) -> str:
+    """List view of every epic with the same cockpit chrome as
+    /cockpit/director."""
+    safe_token = h(token)
+    rows_html: list[str] = []
+    for e in epics:
+        eid = h(str(e.get("id")))
+        title = h(str(e.get("title") or "(no title)"))
+        status = h(str(e.get("status") or "unknown"))
+        cost = h(_fmt_money(e.get("cost_so_far_usd")))
+        budget = h(_fmt_money(e.get("max_cost_usd")))
+        progress = _epic_progress_pct(e)
+        last_prog = h(_fmt_iso_short(e.get("last_progress_at")))
+        gh_url = e.get("gh_issue_url") or ""
+        gh_link = (
+            f'<a href="{h(gh_url)}" target="_blank" rel="noopener">'
+            f"#{h(str(e.get('gh_issue_number') or ''))}</a>"
+            if gh_url else "—"
+        )
+        session_link = _factory_session_link(e.get("factory_session_id"))
+        rows_html.append(
+            "<tr>"
+            f'<td><a href="/cockpit/epics/{eid}?token={safe_token}" '
+            f'class="accent">#{eid}</a></td>'
+            f"<td>{title}</td>"
+            f"<td>{_epic_status_badge(status)}</td>"
+            f'<td><div class="progress"><div class="bar" '
+            f'style="width:{progress}%"></div>'
+            f'<span>{progress}%</span></div></td>'
+            f'<td>{cost} <span class="muted">/ {budget}</span></td>'
+            f"<td>{last_prog}</td>"
+            f"<td>{session_link}</td>"
+            f"<td>{gh_link}</td>"
+            "</tr>"
+        )
+    if not rows_html:
+        rows_html.append(
+            '<tr><td colspan="8" class="empty">no epics</td></tr>'
+        )
+
+    counts_html = " · ".join(
+        f'<span class="count count-{h(s)}">{h(s)}: '
+        f"{int(counts.get(s, 0))}</span>"
+        for s in _EPIC_STATUSES
+    )
+
+    filter_opts = [
+        '<option value="all"'
+        + (" selected" if status_filter == "all" else "")
+        + ">all</option>"
+    ]
+    for s in _EPIC_STATUSES:
+        sel = " selected" if status_filter == s else ""
+        filter_opts.append(f'<option value="{h(s)}"{sel}>{h(s)}</option>')
+
+    return f"""<!DOCTYPE html>
+<html><head>
+  <title>motto cockpit · epics</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    :root {{
+      --bg: #0e1116; --panel: #161b22; --border: #2d333b;
+      --fg: #e6edf3; --muted: #7d8590; --accent: #2f81f7;
+      --ok: #3fb950; --warn: #d29922; --err: #f85149;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg); color: var(--fg); font-size: 14px; min-height: 100vh;
+    }}
+    .top {{
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 10px 16px; border-bottom: 1px solid var(--border);
+      background: var(--panel); flex-wrap: wrap; gap: 8px;
+    }}
+    .top h1 {{ margin: 0; font-size: 16px; font-weight: 600; }}
+    .top a {{ color: var(--accent); text-decoration: none; font-size: 12px; }}
+    .top .meta {{ color: var(--muted); font-size: 12px; }}
+    .toolbar {{
+      display: flex; gap: 8px; padding: 10px 16px;
+      border-bottom: 1px solid var(--border); background: var(--panel);
+      flex-wrap: wrap; align-items: center;
+    }}
+    .toolbar select, .toolbar button {{
+      background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+      padding: 6px 12px; border-radius: 6px; font-size: 13px; cursor: pointer;
+    }}
+    .toolbar button:hover {{ border-color: var(--accent); }}
+    .toolbar .counts {{ color: var(--muted); font-size: 12px; margin-left: auto; }}
+    .counts span {{ margin-left: 8px; }}
+    .count-active {{ color: var(--ok); }}
+    .count-paused {{ color: var(--warn); }}
+    .count-abandoned {{ color: var(--err); }}
+    .count-closed {{ color: var(--accent); }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+    th, td {{
+      text-align: left; padding: 8px 12px;
+      border-bottom: 1px solid var(--border); vertical-align: middle;
+    }}
+    th {{
+      color: var(--muted); font-weight: 600; font-size: 11px;
+      text-transform: uppercase; letter-spacing: 0.4px;
+      background: var(--panel);
+    }}
+    tr:hover td {{ background: rgba(47, 129, 247, 0.05); }}
+    .muted {{ color: var(--muted); font-size: 11px; }}
+    .accent {{ color: var(--accent); text-decoration: none; }}
+    .accent:hover {{ text-decoration: underline; }}
+    .empty {{ text-align: center; padding: 24px; color: var(--muted); }}
+    .progress {{
+      position: relative; background: #21262d; border-radius: 4px;
+      height: 16px; width: 100%; max-width: 160px; overflow: hidden;
+    }}
+    .progress .bar {{
+      background: var(--accent); height: 100%; transition: width 0.3s;
+    }}
+    .progress span {{
+      position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+      font-size: 10px; font-weight: 600; color: var(--fg);
+    }}
+    .badge {{
+      display: inline-block; padding: 2px 8px; border-radius: 4px;
+      font-size: 11px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.4px;
+    }}
+    .badge-proposed   {{ background: #30363d; color: var(--fg); }}
+    .badge-active     {{ background: #1f6feb44; color: var(--ok); border: 1px solid var(--ok); }}
+    .badge-paused     {{ background: #d2992233; color: var(--warn); border: 1px solid var(--warn); }}
+    .badge-closed     {{ background: #1f6feb33; color: var(--accent); border: 1px solid var(--accent); }}
+    .badge-abandoned  {{ background: #f8514922; color: var(--err); border: 1px solid var(--err); }}
+    .badge-unknown    {{ background: #30363d; color: var(--muted); }}
+    @media (max-width: 700px) {{
+      table {{ display: block; overflow-x: auto; white-space: nowrap; }}
+      .toolbar {{ padding: 8px 12px; }}
+    }}
+  </style>
+</head><body>
+  <div class="top">
+    <div>
+      <h1>cockpit · epics</h1>
+      <div class="meta">multi-cycle epic plans · pause/kill/reprompt control plane</div>
+    </div>
+    <div>
+      <a href="/cockpit?token={safe_token}">← back to cockpit</a> ·
+      <a href="/cockpit/director?token={safe_token}">director queue</a>
+    </div>
+  </div>
+  <div class="toolbar">
+    <form method="get" action="/cockpit/epics" style="display:flex;gap:8px;align-items:center;">
+      <input type="hidden" name="token" value="{safe_token}">
+      <label class="muted" for="f-status">status</label>
+      <select id="f-status" name="status" onchange="this.form.submit()">
+        {''.join(filter_opts)}
+      </select>
+      <button type="submit">apply</button>
+    </form>
+    <span class="counts">{counts_html}</span>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>id</th><th>title</th><th>status</th><th>progress</th>
+        <th>cost / budget</th><th>last progress</th>
+        <th>droid session</th><th>gh issue</th>
+      </tr>
+    </thead>
+    <tbody>{''.join(rows_html)}</tbody>
+  </table>
+</body></html>"""
+
+
+def _render_epic_detail(
+    token: str,
+    epic: dict[str, Any],
+    events: list[dict[str, Any]],
+    swarm: list[dict[str, Any]],
+    gh_data: dict[str, Any],
+) -> str:
+    """Detail view: issue body, comments, sub-issues, fleet events, swarm
+    members, plus pause/kill/reprompt buttons."""
+    safe_token = h(token)
+    epic_id = int(epic["id"])
+    title = h(str(epic.get("title") or "(no title)"))
+    status = (epic.get("status") or "unknown").lower()
+    gh_url = epic.get("gh_issue_url") or ""
+    gh_num = epic.get("gh_issue_number")
+    session_id = epic.get("factory_session_id")
+    session_link = _factory_session_link(session_id)
+    progress = _epic_progress_pct(epic)
+    cost = h(_fmt_money(epic.get("cost_so_far_usd")))
+    budget = h(_fmt_money(epic.get("max_cost_usd")))
+    max_hours = epic.get("max_hours")
+    rationale = h(str(epic.get("rationale") or ""))
+    kpi_ref = h(str(epic.get("kpi_ref") or ""))
+    plan = epic.get("plan") or []
+    sc_json = epic.get("success_criteria_json") or []
+    created = h(_fmt_iso_short(epic.get("created_at")))
+    last_prog = h(_fmt_iso_short(epic.get("last_progress_at")))
+    closed_reason = h(str(epic.get("closed_reason") or ""))
+    issue = gh_data.get("issue") or {}
+    issue_body = str(issue.get("body") or "")
+    issue_state = issue.get("state") or ""
+    comments = gh_data.get("comments") or []
+    sub_issues = gh_data.get("sub_issues") or []
+    gh_errors = gh_data.get("errors") or []
+
+    plan_html = "—"
+    if isinstance(plan, list) and plan:
+        items = []
+        for step in plan:
+            if isinstance(step, dict):
+                label = (
+                    step.get("title") or step.get("step")
+                    or step.get("id") or ""
+                )
+                items.append(f"<li>{h(str(label))}</li>")
+            else:
+                items.append(f"<li>{h(str(step))}</li>")
+        plan_html = "<ol>" + "".join(items) + "</ol>"
+
+    sc_html = "—"
+    if isinstance(sc_json, list) and sc_json:
+        items = []
+        for c in sc_json:
+            if isinstance(c, dict):
+                label = (
+                    c.get("title") or c.get("name") or c.get("id") or str(c)
+                )
+                st = c.get("status") or c.get("state") or "pending"
+                items.append(
+                    f'<li><span class="badge badge-{h(str(st).lower())}">'
+                    f"{h(str(st))}</span> {h(str(label))}</li>"
+                )
+            else:
+                items.append(f"<li>{h(str(c))}</li>")
+        sc_html = "<ul>" + "".join(items) + "</ul>"
+
+    if comments:
+        parts = []
+        for c in comments:
+            user = (c.get("user") or {}).get("login") or "?"
+            when = _fmt_iso_short(c.get("created_at"))
+            body = c.get("body") or ""
+            url = c.get("html_url") or ""
+            link_html = (
+                f' · <a href="{h(url)}" target="_blank" class="accent">view</a>'
+                if url else ""
+            )
+            parts.append(
+                '<div class="comment">'
+                '<div class="comment-head">'
+                f"<b>{h(str(user))}</b> · "
+                f'<span class="muted">{h(when)}</span>{link_html}'
+                "</div>"
+                f'<pre class="comment-body">{h(body)}</pre>'
+                "</div>"
+            )
+        comments_html = "".join(parts)
+    else:
+        comments_html = '<div class="empty">no comments fetched</div>'
+
+    if sub_issues:
+        rows = []
+        for si in sub_issues:
+            num = si.get("number")
+            st = (si.get("state") or "open").lower()
+            t = si.get("title") or ""
+            u = si.get("html_url") or ""
+            rows.append(
+                "<tr>"
+                f'<td><a href="{h(u)}" target="_blank" class="accent">'
+                f"#{h(str(num))}</a></td>"
+                f'<td><span class="badge badge-{h(st)}">{h(st)}</span></td>'
+                f"<td>{h(str(t))}</td>"
+                "</tr>"
+            )
+        sub_html = (
+            '<table class="inner"><thead><tr><th>#</th><th>state</th>'
+            "<th>title</th></tr></thead><tbody>"
+            + "".join(rows) + "</tbody></table>"
+        )
+    else:
+        sub_html = '<div class="empty">no sub-issues</div>'
+
+    if swarm:
+        rows = []
+        for s in swarm:
+            rows.append(
+                "<tr>"
+                f"<td><code>{h(str(s.get('agent_name') or '—'))}</code></td>"
+                f"<td>{h(str(s.get('agent_kind') or '—'))}</td>"
+                f"<td>{h(str(s.get('deploy_target') or '—'))}</td>"
+                f"<td>{h(str(s.get('run_status') or '—'))}</td>"
+                f"<td>{h(_fmt_iso_short(s.get('last_seen_at')))}</td>"
+                "</tr>"
+            )
+        swarm_html = (
+            '<table class="inner"><thead><tr><th>agent</th><th>kind</th>'
+            "<th>deploy</th><th>last run</th><th>last seen</th></tr></thead>"
+            "<tbody>" + "".join(rows) + "</tbody></table>"
+        )
+    else:
+        swarm_html = '<div class="empty">no swarm members yet</div>'
+
+    if events:
+        rows = []
+        for ev in events:
+            payload = ev.get("payload") or {}
+            try:
+                pj = json.dumps(payload, default=str)
+            except Exception:
+                pj = str(payload)
+            if len(pj) > 160:
+                pj = pj[:157] + "…"
+            rows.append(
+                "<tr>"
+                f"<td>{h(_fmt_iso_short(ev.get('ts')))}</td>"
+                f"<td><code>{h(str(ev.get('kind') or ''))}</code></td>"
+                f"<td>{h(str(ev.get('agent_name') or '—'))}</td>"
+                f"<td><code>{h(pj)}</code></td>"
+                "</tr>"
+            )
+        events_html = (
+            '<table class="inner"><thead><tr><th>when</th><th>kind</th>'
+            "<th>agent</th><th>payload</th></tr></thead><tbody>"
+            + "".join(rows) + "</tbody></table>"
+        )
+    else:
+        events_html = '<div class="empty">no events for this run</div>'
+
+    gh_err_html = ""
+    if gh_errors:
+        gh_err_html = (
+            '<div class="err-banner">github fetch issues: '
+            + h(" · ".join(gh_errors)) + "</div>"
+        )
+
+    gh_issue_summary = (
+        f'<a href="{h(gh_url)}" target="_blank" class="accent">'
+        f"#{h(str(gh_num))}</a> "
+        f'<span class="muted">({h(str(issue_state) or "unknown")})</span>'
+        if gh_url else "—"
+    )
+    max_hours_html = h(str(max_hours)) if max_hours is not None else "—"
+    session_safe = h(str(session_id or "—"))
+
+    return f"""<!DOCTYPE html>
+<html><head>
+  <title>epic #{epic_id} · {title}</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    :root {{
+      --bg: #0e1116; --panel: #161b22; --border: #2d333b;
+      --fg: #e6edf3; --muted: #7d8590; --accent: #2f81f7;
+      --ok: #3fb950; --warn: #d29922; --err: #f85149;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg); color: var(--fg); font-size: 14px; min-height: 100vh;
+    }}
+    .top {{
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 10px 16px; border-bottom: 1px solid var(--border);
+      background: var(--panel); flex-wrap: wrap; gap: 8px;
+    }}
+    .top h1 {{ margin: 0; font-size: 16px; font-weight: 600; }}
+    .top a {{ color: var(--accent); text-decoration: none; font-size: 12px; }}
+    .meta {{ color: var(--muted); font-size: 12px; }}
+    .container {{ padding: 16px; max-width: 1180px; margin: 0 auto; }}
+    .grid {{
+      display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+      margin-bottom: 12px;
+    }}
+    @media (max-width: 900px) {{ .grid {{ grid-template-columns: 1fr; }} }}
+    .panel {{
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 8px;
+    }}
+    .panel h2 {{
+      margin: 0; padding: 10px 14px; font-size: 12px; font-weight: 600;
+      border-bottom: 1px solid var(--border); color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.5px;
+      display: flex; justify-content: space-between; align-items: center;
+    }}
+    .panel .body {{ padding: 12px 14px; }}
+    .kv {{ display: grid; grid-template-columns: 140px 1fr; gap: 4px 12px; font-size: 13px; }}
+    .kv dt {{ color: var(--muted); }}
+    .kv dd {{ margin: 0; word-break: break-word; }}
+    .actions {{
+      display: flex; gap: 8px; flex-wrap: wrap; padding: 12px 14px;
+      border-top: 1px solid var(--border);
+    }}
+    .actions button {{
+      background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+      padding: 8px 16px; border-radius: 6px; font-size: 13px; cursor: pointer;
+      font-weight: 500;
+    }}
+    .actions button.pause {{ border-color: var(--warn); color: var(--warn); }}
+    .actions button.pause:hover {{ background: var(--warn); color: #fff; }}
+    .actions button.kill {{ border-color: var(--err); color: var(--err); }}
+    .actions button.kill:hover {{ background: var(--err); color: #fff; }}
+    .actions button.reprompt {{ border-color: var(--accent); color: var(--accent); }}
+    .actions button.reprompt:hover {{ background: var(--accent); color: #fff; }}
+    .actions button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+    pre.body-md, pre.comment-body {{
+      background: #0d1117; border: 1px solid var(--border); border-radius: 6px;
+      padding: 10px 12px; overflow-x: auto; font-size: 12px;
+      white-space: pre-wrap; word-wrap: break-word; line-height: 1.5;
+      color: var(--fg); margin: 0;
+    }}
+    .comment {{ margin-bottom: 12px; }}
+    .comment-head {{ font-size: 12px; margin-bottom: 4px; }}
+    .badge {{
+      display: inline-block; padding: 2px 8px; border-radius: 4px;
+      font-size: 10px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.4px;
+    }}
+    .badge-active, .badge-open    {{ background: #1f6feb44; color: var(--ok); border: 1px solid var(--ok); }}
+    .badge-paused                 {{ background: #d2992233; color: var(--warn); border: 1px solid var(--warn); }}
+    .badge-closed                 {{ background: #1f6feb33; color: var(--accent); border: 1px solid var(--accent); }}
+    .badge-abandoned              {{ background: #f8514922; color: var(--err); border: 1px solid var(--err); }}
+    .badge-proposed, .badge-pending, .badge-unknown {{ background: #30363d; color: var(--muted); }}
+    .badge-done, .badge-passed, .badge-complete, .badge-completed {{ background: #3fb95022; color: var(--ok); border: 1px solid var(--ok); }}
+    .badge-failed                 {{ background: #f8514922; color: var(--err); border: 1px solid var(--err); }}
+    table.inner {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
+    table.inner th, table.inner td {{
+      text-align: left; padding: 6px 8px;
+      border-bottom: 1px solid var(--border);
+    }}
+    table.inner th {{ color: var(--muted); font-weight: 600; font-size: 11px; }}
+    .empty {{ color: var(--muted); padding: 12px; text-align: center; font-style: italic; }}
+    .accent {{ color: var(--accent); text-decoration: none; }}
+    .accent:hover {{ text-decoration: underline; }}
+    .muted {{ color: var(--muted); }}
+    .progress {{
+      position: relative; background: #21262d; border-radius: 4px;
+      height: 16px; width: 140px; overflow: hidden; display: inline-block;
+      vertical-align: middle;
+    }}
+    .progress .bar {{ background: var(--accent); height: 100%; }}
+    .progress span {{
+      position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+      font-size: 10px; font-weight: 600;
+    }}
+    .err-banner {{
+      background: #3d1d1d; color: var(--err); padding: 10px 16px;
+      border: 1px solid var(--err); border-radius: 6px; margin-bottom: 12px;
+      font-size: 12px;
+    }}
+    #toast {{
+      position: fixed; bottom: 20px; right: 20px; padding: 12px 18px;
+      border-radius: 6px; font-size: 13px; opacity: 0; pointer-events: none;
+      transition: opacity 0.2s;
+    }}
+    #toast.show {{ opacity: 1; }}
+    #toast.ok  {{ background: var(--ok); color: #fff; }}
+    #toast.err {{ background: var(--err); color: #fff; }}
+    textarea {{
+      width: 100%; min-height: 70px; background: var(--bg); color: var(--fg);
+      border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px;
+      font-family: inherit; font-size: 13px; resize: vertical;
+    }}
+  </style>
+</head><body>
+  <div class="top">
+    <div>
+      <h1>epic #{epic_id} · {title}</h1>
+      <div class="meta">
+        {_epic_status_badge(status)} ·
+        progress
+        <span class="progress"><span class="bar" style="width:{progress}%"></span><span>{progress}%</span></span>
+        · cost {cost} / {budget}
+      </div>
+    </div>
+    <div>
+      <a href="/cockpit/epics?token={safe_token}">← all epics</a> ·
+      <a href="/cockpit?token={safe_token}">cockpit</a>
+    </div>
+  </div>
+
+  <div class="container">
+    {gh_err_html}
+
+    <div class="grid">
+      <div class="panel">
+        <h2>epic metadata</h2>
+        <div class="body">
+          <dl class="kv">
+            <dt>status</dt><dd>{_epic_status_badge(status)}</dd>
+            <dt>kpi_ref</dt><dd>{kpi_ref or '—'}</dd>
+            <dt>rationale</dt><dd>{rationale or '—'}</dd>
+            <dt>created</dt><dd>{created}</dd>
+            <dt>last progress</dt><dd>{last_prog}</dd>
+            <dt>max hours</dt><dd>{max_hours_html}</dd>
+            <dt>cost / budget</dt><dd>{cost} / {budget}</dd>
+            <dt>droid session</dt><dd>{session_link}</dd>
+            <dt>gh issue</dt><dd>{gh_issue_summary}</dd>
+            <dt>closed reason</dt><dd>{closed_reason or '—'}</dd>
+          </dl>
+        </div>
+        <div class="actions">
+          <button class="pause"    onclick="actEpic('pause')">pause</button>
+          <button class="kill"     onclick="actEpic('kill')">kill</button>
+          <button class="reprompt" onclick="openReprompt()">reprompt</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>plan &amp; success criteria</h2>
+        <div class="body">
+          <h3 class="muted" style="margin:0 0 6px;font-size:11px;text-transform:uppercase;">plan</h3>
+          {plan_html}
+          <h3 class="muted" style="margin:14px 0 6px;font-size:11px;text-transform:uppercase;">success criteria</h3>
+          {sc_html}
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-bottom:12px;">
+      <h2>github issue body</h2>
+      <div class="body">
+        <pre class="body-md">{h(issue_body) if issue_body else '(empty)'}</pre>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="panel">
+        <h2>sub-issues</h2>
+        <div class="body">{sub_html}</div>
+      </div>
+      <div class="panel">
+        <h2>worker swarm</h2>
+        <div class="body">{swarm_html}</div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-bottom:12px;">
+      <h2>recent comments (last 30)</h2>
+      <div class="body">{comments_html}</div>
+    </div>
+
+    <div class="panel">
+      <h2>fleet events (run scope)</h2>
+      <div class="body">{events_html}</div>
+    </div>
+  </div>
+
+  <div id="reprompt-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:100;align-items:center;justify-content:center;">
+    <div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:16px;width:90%;max-width:540px;">
+      <h3 style="margin:0 0 8px;">reprompt droid session</h3>
+      <p class="muted" style="font-size:12px;margin:0 0 8px;">
+        sent as a user message to factory session
+        <code>{session_safe}</code>
+      </p>
+      <textarea id="reprompt-text" placeholder="message to send the droid…"></textarea>
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px;">
+        <button onclick="closeReprompt()" style="background:var(--bg);color:var(--fg);border:1px solid var(--border);padding:8px 16px;border-radius:6px;cursor:pointer;">cancel</button>
+        <button class="reprompt" onclick="sendReprompt()" style="background:var(--accent);color:#fff;border:0;padding:8px 16px;border-radius:6px;cursor:pointer;">send</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+
+<script>
+const TOKEN = "{safe_token}";
+const EPIC_ID = {epic_id};
+const Q = "?token=" + encodeURIComponent(TOKEN);
+
+function toast(msg, ok) {{
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.className = "show " + (ok ? "ok" : "err");
+  setTimeout(() => {{ t.className = ""; }}, 3000);
+}}
+
+async function actEpic(kind) {{
+  const verb = kind === "pause" ? "Pause" : "Kill";
+  const reason = prompt(verb + " reason (optional):") || "";
+  if (kind === "kill" && !confirm("Really KILL epic #" + EPIC_ID + "? This is irreversible.")) {{
+    return;
+  }}
+  try {{
+    const r = await fetch("/cockpit/epics/" + EPIC_ID + "/" + kind + Q, {{
+      method: "POST",
+      headers: {{ "content-type": "application/json" }},
+      body: JSON.stringify({{ reason: reason }})
+    }});
+    const d = await r.json();
+    if (d.ok) {{
+      toast(verb + " ok (via " + (d.via || "?") + ")", true);
+      setTimeout(() => location.reload(), 600);
+    }} else {{
+      toast(d.error || "failed", false);
+    }}
+  }} catch (err) {{
+    toast(err.message, false);
+  }}
+}}
+
+function openReprompt() {{
+  document.getElementById("reprompt-modal").style.display = "flex";
+  setTimeout(() => document.getElementById("reprompt-text").focus(), 50);
+}}
+
+function closeReprompt() {{
+  document.getElementById("reprompt-modal").style.display = "none";
+}}
+
+async function sendReprompt() {{
+  const txt = (document.getElementById("reprompt-text").value || "").trim();
+  if (!txt) {{ toast("empty message", false); return; }}
+  try {{
+    const r = await fetch("/cockpit/epics/" + EPIC_ID + "/reprompt" + Q, {{
+      method: "POST",
+      headers: {{ "content-type": "application/json" }},
+      body: JSON.stringify({{ message: txt }})
+    }});
+    const d = await r.json();
+    if (d.ok) {{
+      toast("reprompt sent", true);
+      closeReprompt();
+      document.getElementById("reprompt-text").value = "";
+    }} else {{
+      toast(d.error || "failed", false);
+    }}
+  }} catch (err) {{
+    toast(err.message, false);
+  }}
+}}
 </script>
 </body></html>"""

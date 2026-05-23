@@ -1222,6 +1222,190 @@ class Database:
                 )
             return result.endswith(" 1")
 
+    # -- Cockpit epics view helpers (Worker F) ---------------------------
+    # Cockpit needs richer reads than director_epics(): the new GH/Factory
+    # columns added in 0007_epics_extension.sql, plus per-run event drill-
+    # down and swarm membership. Read-only -- write paths still funnel
+    # through director_set_epic_status / MCP tools.
+
+    _EPIC_COLUMNS_FULL = (
+        "id, run_id, title, kpi_ref, rationale, "
+        "estimated_cycles, success_criteria, plan, "
+        "status, approved_by, approved_at, closed_at, closed_reason, "
+        "created_at, updated_at, "
+        "gh_issue_url, gh_issue_number, factory_session_id, "
+        "cost_so_far_usd, max_cost_usd, max_hours, "
+        "success_criteria_json, last_progress_at"
+    )
+
+    @staticmethod
+    def _normalize_epic_row(d: dict[str, Any]) -> dict[str, Any]:
+        plan = d.get("plan")
+        if isinstance(plan, str):
+            try:
+                d["plan"] = json.loads(plan)
+            except (ValueError, TypeError):
+                d["plan"] = []
+        sc = d.get("success_criteria_json")
+        if isinstance(sc, str):
+            try:
+                d["success_criteria_json"] = json.loads(sc)
+            except (ValueError, TypeError):
+                d["success_criteria_json"] = None
+        for k in (
+            "created_at", "updated_at",
+            "approved_at", "closed_at", "last_progress_at",
+        ):
+            v = d.get(k)
+            if v is not None:
+                d[k] = v.isoformat()
+        for k in ("cost_so_far_usd", "max_cost_usd"):
+            v = d.get(k)
+            if v is not None:
+                try:
+                    d[k] = float(v)
+                except (TypeError, ValueError):
+                    d[k] = None
+        rid = d.get("run_id")
+        if rid is not None:
+            d["run_id"] = str(rid)
+        return d
+
+    async def list_epics_full(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Cockpit list view: all epics with GH/Factory/cost columns from
+        migration 0007. Pass status='all' or None to skip filtering."""
+        cols = self._EPIC_COLUMNS_FULL
+        async with self.pool.acquire() as conn:
+            if status and status != "all":
+                rows = await conn.fetch(
+                    f"""
+                    SELECT {cols}
+                    FROM public.epics
+                    WHERE status = $1
+                    ORDER BY created_at DESC
+                    LIMIT $2
+                    """,
+                    status, int(limit),
+                )
+            else:
+                rows = await conn.fetch(
+                    f"""
+                    SELECT {cols}
+                    FROM public.epics
+                    ORDER BY created_at DESC
+                    LIMIT $1
+                    """,
+                    int(limit),
+                )
+            return [self._normalize_epic_row(dict(r)) for r in rows]
+
+    async def get_epic_full(self, *, epic_id: int) -> dict[str, Any] | None:
+        """Cockpit detail view: full epic row including new GH columns."""
+        cols = self._EPIC_COLUMNS_FULL
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT {cols} FROM public.epics WHERE id = $1",
+                int(epic_id),
+            )
+            if not row:
+                return None
+            return self._normalize_epic_row(dict(row))
+
+    async def events_for_run(
+        self,
+        *,
+        run_id: str,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Recent fleet.events for a given run plus child runs.
+        Empty list if run_id is falsy or malformed."""
+        if not run_id:
+            return []
+        try:
+            rid = UUID(str(run_id))
+        except (ValueError, TypeError, AttributeError):
+            return []
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT e.id, e.ts, e.level, e.kind, e.payload,
+                       a.name AS agent_name, e.run_id
+                FROM fleet.events e
+                JOIN fleet.agents a ON a.id = e.agent_id
+                LEFT JOIN fleet.runs r ON r.id = e.run_id
+                WHERE e.run_id = $1 OR r.parent_run_id = $1
+                ORDER BY e.ts DESC
+                LIMIT $2
+                """,
+                rid, int(limit),
+            )
+            return [
+                {
+                    "id": r["id"],
+                    "ts": r["ts"].isoformat(),
+                    "level": r["level"],
+                    "kind": r["kind"],
+                    "payload": r["payload"],
+                    "agent_name": r["agent_name"],
+                    "run_id": str(r["run_id"]) if r["run_id"] else None,
+                }
+                for r in rows
+            ]
+
+    async def swarm_for_run(
+        self,
+        *,
+        run_id: str,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """List unique agents whose runs descend from `run_id` (worker
+        swarm). Empty list if run_id is malformed."""
+        if not run_id:
+            return []
+        try:
+            rid = UUID(str(run_id))
+        except (ValueError, TypeError, AttributeError):
+            return []
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT DISTINCT ON (a.name)
+                       a.name AS agent_name,
+                       a.kind AS agent_kind,
+                       a.deploy_target,
+                       a.last_seen_at,
+                       r.id   AS run_id,
+                       r.kind AS run_kind,
+                       r.status AS run_status,
+                       r.started_at,
+                       r.finished_at,
+                       r.intent
+                FROM fleet.runs r
+                JOIN fleet.agents a ON a.id = r.agent_id
+                WHERE r.parent_run_id = $1
+                   OR r.id = $1
+                ORDER BY a.name, r.started_at DESC
+                LIMIT $2
+                """,
+                rid, int(limit),
+            )
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                d = dict(r)
+                if d.get("run_id") is not None:
+                    d["run_id"] = str(d["run_id"])
+                for k in ("last_seen_at", "started_at", "finished_at"):
+                    v = d.get(k)
+                    if v is not None:
+                        d[k] = v.isoformat()
+                out.append(d)
+            return out
+
     # -- Epic control plane helpers (Day-0 bootstrap) --------------------
 
     async def insert_epic_with_gh(
