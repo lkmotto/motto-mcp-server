@@ -1237,16 +1237,101 @@ class Database:
         kpi_ref: str = "",
         max_cost_usd: float = 25.0,
         max_hours: int = 8,
+        status: str = "proposed",
         run_id: str | None = None,
     ) -> dict[str, Any]:
-        """Insert a new epic row with GitHub-linked fields."""
-        raise NotImplementedError("Worker A: implement insert_epic_with_gh")
+        """Insert a new epic row with GitHub-linked fields.
+
+        Returns the inserted row's id, status, and created_at. The rationale
+        column stores the issue body so epic_status can replay it without
+        re-fetching from GitHub. success_criteria is stored both as text
+        (joined) for legacy consumers and as the structured list in
+        success_criteria_json.
+        """
+        if status not in ("proposed", "active", "paused", "closed", "abandoned"):
+            raise ValueError(f"invalid epic status: {status}")
+        kpi = (kpi_ref or "").strip() or f"gh:{repo_full_name}#{gh_issue_number}"
+        crit_list = list(success_criteria or [])
+        crit_text = "\n".join(f"- {c}" for c in crit_list) if crit_list else ""
+        plan_payload: list[dict[str, Any]] = []
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO public.epics
+                    (run_id, title, kpi_ref, rationale, estimated_cycles,
+                     success_criteria, plan, status,
+                     gh_issue_url, gh_issue_number,
+                     max_cost_usd, max_hours, success_criteria_json,
+                     last_progress_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8,
+                        $9, $10, $11, $12, $13::jsonb, NOW())
+                RETURNING id, status, created_at
+                """,
+                run_id, title, kpi, body or "", 0,
+                crit_text, json.dumps(plan_payload), status,
+                gh_issue_url, int(gh_issue_number),
+                float(max_cost_usd), int(max_hours),
+                json.dumps(crit_list),
+            )
+            return {
+                "id": int(row["id"]),
+                "status": row["status"],
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            }
 
     async def update_epic_session_id(
         self, *, epic_id: int, factory_session_id: str
     ) -> bool:
-        """Lock an epic to a Factory session."""
-        raise NotImplementedError("Worker A: implement update_epic_session_id")
+        """Lock an epic to a Factory session.
+
+        Idempotent: only sets factory_session_id when it is currently NULL.
+        Returns True if the row was updated (lock acquired), False if the
+        epic was already locked to a session.
+        """
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE public.epics
+                SET factory_session_id = $2,
+                    last_progress_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = $1 AND factory_session_id IS NULL
+                """,
+                int(epic_id), factory_session_id,
+            )
+            return result.endswith(" 1")
+
+    async def fetch_epic_dispatch_row(self, *, epic_id: int) -> dict[str, Any] | None:
+        """Fetch minimum fields needed to dispatch a droid for an epic."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, title, rationale, status,
+                       gh_issue_url, gh_issue_number,
+                       max_cost_usd, max_hours, success_criteria_json,
+                       factory_session_id
+                FROM public.epics
+                WHERE id = $1
+                """,
+                int(epic_id),
+            )
+            if row is None:
+                return None
+            d = dict(row)
+            sc = d.get("success_criteria_json")
+            if isinstance(sc, str):
+                try:
+                    d["success_criteria_json"] = json.loads(sc)
+                except (TypeError, ValueError):
+                    d["success_criteria_json"] = []
+            for k in ("max_cost_usd",):
+                v = d.get(k)
+                if v is not None:
+                    try:
+                        d[k] = float(v)
+                    except (TypeError, ValueError):
+                        d[k] = None
+            return d
 
     async def fetch_epic_for_status(self, *, epic_id: int) -> dict[str, Any] | None:
         """Fetch full epic row for epic_status tool."""
