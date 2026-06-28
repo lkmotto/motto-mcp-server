@@ -1,5 +1,5 @@
 [project]
-name = "motto-mcp-server"
+name = "motto_mcp_server"
 version = "0.1.0"
 description = "FastMCP fleet-coordination server backed by Neon Postgres."
 readme = "README.md"
