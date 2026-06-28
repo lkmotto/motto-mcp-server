@@ -15,7 +15,7 @@ database.  The goal is to verify:
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -270,11 +270,7 @@ async def test_get_rotation_includes_decision_link(server):
     decision_id = str(uuid.uuid4())
     job_id = uuid.uuid4()
     started = _now()
-    ended = datetime(
-        started.year, started.month, started.day,
-        started.hour, started.minute, started.second + 5,
-        tzinfo=UTC,
-    )
+    ended = started + timedelta(seconds=5)
     row = _job_row(
         job_id=str(job_id),
         service="anthropic",
