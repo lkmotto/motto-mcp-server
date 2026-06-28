@@ -1,0 +1,19 @@
+---
+name: Documentation Improvement
+about: Suggest improvements to documentation
+title: 'docs: '
+labels: documentation
+assignees: ''
+---
+
+## What's missing or unclear?
+Describe the documentation gap.
+
+## Suggested improvement
+How should this be documented?
+
+## Where should it go?
+Link to the relevant doc page or suggest a location.
+
+## Additional context
+Add any other context here.
