@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: GitHub Discussions
+    url: https://github.com/lkmotto/motto-mcp-server/discussions
+    about: Please ask and answer questions here.
+  - name: Documentation
+    url: https://github.com/lkmotto/motto-mcp-server#readme
+    about: Check the README and docs first.
