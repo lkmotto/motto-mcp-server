@@ -493,7 +493,7 @@ class Database:
                 """,
                 since_minutes, agent_name, status, limit,
             )
-            return [_run_row_to_dict(r) for r in rows]
+            return [d for r in rows if (d := _run_row_to_dict(r)) is not None]
 
     async def get_run(self, *, run_id: str) -> dict[str, Any]:
         rid = UUID(run_id)

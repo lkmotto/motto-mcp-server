@@ -18,16 +18,16 @@ response to capability_requests director files when it actually needs them.
 
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+from . import merge_pr as _merge_pr
+from . import noop as _noop
 
 # Re-export for backwards compatibility — verifier modules now import
 # directly from `.types`, but external callers may still do
 # `from mcp_server.verifiers import VerifyContext, VerifyResult`.
 from .types import VerifyContext, VerifyResult
-
-from . import noop as _noop
-from . import merge_pr as _merge_pr
-
 
 # kind -> verifier callable
 # Verifiers must accept (move: dict, ctx: VerifyContext) and return VerifyResult.

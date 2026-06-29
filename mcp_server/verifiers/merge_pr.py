@@ -18,7 +18,6 @@ from typing import Any
 
 from .types import VerifyContext, VerifyResult
 
-
 _GITHUB_API = "https://api.github.com"
 
 

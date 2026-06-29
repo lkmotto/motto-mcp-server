@@ -29,7 +29,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from html import escape as h
 from typing import Any
 
@@ -436,8 +436,11 @@ async def list_local_tasks(
 
 
 import time
+
 import httpx
-from .verifiers import VerifyContext, dispatch as _dispatch_verifier
+
+from .verifiers import VerifyContext
+from .verifiers import dispatch as _dispatch_verifier
 
 
 @mcp.tool
@@ -665,7 +668,7 @@ async def fleet_status_json(request: Request):
         since_minutes=60, agent_name=None, kind=None, limit=200
     )
     return JSONResponse({
-        "now": datetime.now(timezone.utc).isoformat(),
+        "now": datetime.now(UTC).isoformat(),
         "agents": agents,
         "recent_events": events,
     })
@@ -693,7 +696,7 @@ def _fmt_age(ts: str | None) -> str:
         return "—"
     try:
         dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        delta = (datetime.now(timezone.utc) - dt).total_seconds()
+        delta = (datetime.now(UTC) - dt).total_seconds()
         if delta < 0:
             return "now"
         if delta < 60:
@@ -776,7 +779,7 @@ def _render_dashboard(agents: list[dict[str, Any]], events: list[dict[str, Any]]
     else:
         event_rows = '<tr><td colspan="5"><i>no events in last 60 min</i></td></tr>'
 
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    now = datetime.now(UTC).isoformat(timespec="seconds")
 
     return f"""<!DOCTYPE html>
 <html><head>

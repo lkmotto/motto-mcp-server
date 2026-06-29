@@ -21,9 +21,9 @@ async def _build_fleet_context(db: Database) -> str:
         runs = await db.list_runs(
             agent_name=None, status=None, since_minutes=60 * 24, limit=10
         )
-    except Exception as e:  # pragma: no cover
+    except Exception as exc:  # pragma: no cover
         logger.exception("fleet context build failed")
-        return f"[fleet state unavailable: {e}]"
+        return f"[fleet state unavailable: {exc}]"
 
     parts = ["# Live fleet state\n"]
     parts.append(f"Time: {datetime.now(UTC).isoformat(timespec='seconds')}\n")

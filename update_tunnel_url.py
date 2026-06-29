@@ -3,7 +3,10 @@ Startup script: reads cloudflared log for latest tunnel URL
 and updates Cloudflare KV namespace so the Worker proxy stays current.
 Run this after cloudflared starts (service dependency or scheduled task).
 """
-import urllib.request, json, re, time, sys
+import re
+import sys
+import time
+import urllib.request
 
 TOKEN = "cfut_wyodQESvqVnRo0XHStJkCm9MvRf2Z7Sd62SpAgTy0a43d8ab"
 ACCOUNT_ID = "69c676f35299031461fcc0f4b52aa102"
@@ -56,7 +59,7 @@ def main():
 
     for i in range(MAX_RETRIES):
         try:
-            with open(LOG_PATH, "r") as f:
+            with open(LOG_PATH) as f:
                 content = f.read()
             url = extract_tunnel_url(content)
             if url:

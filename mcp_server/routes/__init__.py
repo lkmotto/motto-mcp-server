@@ -203,11 +203,11 @@ def register_routes(mcp, db: Database) -> None:
             {
                 "reply": text,
                 "tool_calls": tool_log,
-                "hops": len(
-                    [tc for tc in tool_log if tc.get("hop") is not None]
-                )
-                and (max(tc.get("hop") for tc in tool_log) + 1)
-                or 0,
+                "hops": (
+                    (max(tc["hop"] for tc in tool_log if tc.get("hop") is not None) + 1)
+                    if any(tc.get("hop") is not None for tc in tool_log)
+                    else 0
+                ),
                 "raw_type": last_resp.get("type"),
                 "model": last_resp.get("model"),
                 "usage": last_resp.get("usage"),
