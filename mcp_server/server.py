@@ -39,7 +39,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from .db import Database
-from .cockpit import register_routes as _register_cockpit_routes
+from .routes import register_routes as _register_cockpit_routes
 
 logger = logging.getLogger(__name__)
 
