@@ -120,9 +120,7 @@ class Database:
         url = os.environ.get("DATABASE_URL") or os.environ.get("NEON_DATABASE_URL")
         if not url:
             raise RuntimeError("DATABASE_URL (or NEON_DATABASE_URL) is required")
-        self._pool = await asyncpg.create_pool(
-            url, min_size=1, max_size=10, init=_init_conn
-        )
+        self._pool = await asyncpg.create_pool(url, min_size=1, max_size=10, init=_init_conn)
 
     async def close(self) -> None:
         if self._pool is not None:
@@ -145,8 +143,7 @@ class Database:
                 " );"
             )
             applied = {
-                r["name"]
-                for r in await conn.fetch("SELECT name FROM fleet.schema_migrations")
+                r["name"] for r in await conn.fetch("SELECT name FROM fleet.schema_migrations")
             }
             for path in sorted(_MIGRATIONS_DIR.glob("*.sql")):
                 if path.name in applied:
@@ -178,7 +175,10 @@ class Database:
                     last_seen_at = now()
                 RETURNING id, name
                 """,
-                name, kind, deploy_target, version,
+                name,
+                kind,
+                deploy_target,
+                version,
             )
             return dict(row)
 
@@ -191,7 +191,8 @@ class Database:
                     metadata = COALESCE(metadata, '{}'::jsonb) || $2
                 WHERE name = $1
                 """,
-                agent_name, status,
+                agent_name,
+                status,
             )
 
     async def start_run(
@@ -212,7 +213,11 @@ class Database:
                 SELECT id, $2, $3, $4, $5 FROM fleet.agents WHERE name = $1
                 RETURNING id
                 """,
-                agent_name, parent, kind, intent, langfuse_trace_id,
+                agent_name,
+                parent,
+                kind,
+                intent,
+                langfuse_trace_id,
             )
 
     async def end_run(
@@ -229,7 +234,9 @@ class Database:
                 SET status = $2, summary = $3, finished_at = now()
                 WHERE id = $1
                 """,
-                UUID(run_id), status, summary,
+                UUID(run_id),
+                status,
+                summary,
             )
 
     async def record_event(
@@ -249,7 +256,11 @@ class Database:
                 SELECT id, $2, $3, $4, $5 FROM fleet.agents WHERE name = $1
                 RETURNING id
                 """,
-                agent_name, rid, kind, payload, level,
+                agent_name,
+                rid,
+                kind,
+                payload,
+                level,
             )
 
     # ── Artifact content capture (motto-director output critic) ───────────
@@ -304,7 +315,11 @@ class Database:
                 FROM fleet.agents WHERE name = $1
                 RETURNING id
                 """,
-                agent_name, rid, kind, name, content,
+                agent_name,
+                rid,
+                kind,
+                name,
+                content,
             )
 
     async def artifacts_pending_review(
@@ -332,7 +347,9 @@ class Database:
                 ORDER BY ar.ts DESC
                 LIMIT $3
                 """,
-                int(since_hours), agent_name, int(limit),
+                int(since_hours),
+                agent_name,
+                int(limit),
             )
             return [
                 {
@@ -372,7 +389,8 @@ class Database:
                             || jsonb_build_object('reviewed_at', now()::text)
                 WHERE id = $1
                 """,
-                int(artifact_id), patch,
+                int(artifact_id),
+                patch,
             )
             return result.endswith(" 1")
 
@@ -397,7 +415,10 @@ class Database:
                 ORDER BY e.ts DESC
                 LIMIT $4
                 """,
-                since_minutes, agent_name, kind, limit,
+                since_minutes,
+                agent_name,
+                kind,
+                limit,
             )
             return [
                 {
@@ -431,12 +452,13 @@ class Database:
                     $3, $4
                 RETURNING id
                 """,
-                target_agent, source_agent, kind, payload,
+                target_agent,
+                source_agent,
+                kind,
+                payload,
             )
 
-    async def consume_intents(
-        self, *, agent_name: str, limit: int
-    ) -> list[dict[str, Any]]:
+    async def consume_intents(self, *, agent_name: str, limit: int) -> list[dict[str, Any]]:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
@@ -456,7 +478,8 @@ class Database:
                 RETURNING i.id, i.kind, i.payload, i.created_at,
                           (SELECT name FROM fleet.agents WHERE id = i.source_agent_id) AS source
                 """,
-                agent_name, limit,
+                agent_name,
+                limit,
             )
             return [
                 {
@@ -491,7 +514,10 @@ class Database:
                 ORDER BY r.started_at DESC
                 LIMIT $4
                 """,
-                since_minutes, agent_name, status, limit,
+                since_minutes,
+                agent_name,
+                status,
+                limit,
             )
             return [d for r in rows if (d := _run_row_to_dict(r)) is not None]
 
@@ -571,7 +597,10 @@ class Database:
                 ORDER BY d.ts DESC
                 LIMIT $4
                 """,
-                rid, agent_name, choice, limit,
+                rid,
+                agent_name,
+                choice,
+                limit,
             )
             return [_decision_row_to_dict(r) for r in rows]
 
@@ -597,9 +626,7 @@ class Database:
 
     async def force_release_lock(self, *, resource: str) -> bool:
         async with self.pool.acquire() as conn:
-            result = await conn.execute(
-                "DELETE FROM fleet.locks WHERE resource = $1", resource
-            )
+            result = await conn.execute("DELETE FROM fleet.locks WHERE resource = $1", resource)
         # asyncpg execute() returns 'DELETE <n>' for DELETE statements.
         try:
             n = int(result.split()[-1])
@@ -743,7 +770,9 @@ class Database:
                 {
                     "id": r["id"],
                     "kind": r["kind"],
-                    "payload": json.loads(r["payload"]) if isinstance(r["payload"], str) else r["payload"],
+                    "payload": json.loads(r["payload"])
+                    if isinstance(r["payload"], str)
+                    else r["payload"],
                     "source": r["source"],
                     "description": r["description"],
                     "created_at": r["created_at"].isoformat(),
@@ -1030,9 +1059,7 @@ class Database:
             )
             return {r["status"]: r["n"] for r in rows}
 
-    async def director_approve_move(
-        self, *, move_id: int, approved_by: str
-    ) -> bool:
+    async def director_approve_move(self, *, move_id: int, approved_by: str) -> bool:
         async with self.pool.acquire() as conn:
             result = await conn.execute(
                 """
@@ -1049,9 +1076,7 @@ class Database:
             # asyncpg returns 'UPDATE n'
             return result.endswith(" 1")
 
-    async def director_reject_move(
-        self, *, move_id: int, approved_by: str
-    ) -> bool:
+    async def director_reject_move(self, *, move_id: int, approved_by: str) -> bool:
         async with self.pool.acquire() as conn:
             result = await conn.execute(
                 """
@@ -1067,9 +1092,7 @@ class Database:
             )
             return result.endswith(" 1")
 
-    async def director_bulk_approve(
-        self, *, move_ids: list[int], approved_by: str
-    ) -> int:
+    async def director_bulk_approve(self, *, move_ids: list[int], approved_by: str) -> int:
         if not move_ids:
             return 0
         async with self.pool.acquire() as conn:
@@ -1149,8 +1172,10 @@ class Database:
                         d["plan"] = []
                 # ISO-ize timestamps
                 for k in (
-                    "created_at", "updated_at",
-                    "approved_at", "closed_at",
+                    "created_at",
+                    "updated_at",
+                    "approved_at",
+                    "closed_at",
                 ):
                     v = d.get(k)
                     if v is not None:
@@ -1178,9 +1203,9 @@ class Database:
         closed_reason: str = "",
     ) -> bool:
         """Transition an epic to a new status. Allowed:
-          proposed -> active | abandoned
-          active   -> paused | closed | abandoned
-          paused   -> active | abandoned
+        proposed -> active | abandoned
+        active   -> paused | closed | abandoned
+        paused   -> active | abandoned
         """
         allowed = {"proposed", "active", "paused", "closed", "abandoned"}
         if new_status not in allowed:
@@ -1197,7 +1222,10 @@ class Database:
                         updated_at = NOW()
                     WHERE id = $1
                     """,
-                    int(epic_id), new_status, approved_by, closed_reason,
+                    int(epic_id),
+                    new_status,
+                    approved_by,
+                    closed_reason,
                 )
             elif new_status == "active":
                 result = await conn.execute(
@@ -1209,7 +1237,8 @@ class Database:
                         updated_at = NOW()
                     WHERE id = $1
                     """,
-                    int(epic_id), approved_by,
+                    int(epic_id),
+                    approved_by,
                 )
             else:  # paused or proposed
                 result = await conn.execute(
@@ -1218,7 +1247,8 @@ class Database:
                     SET status = $2, updated_at = NOW()
                     WHERE id = $1
                     """,
-                    int(epic_id), new_status,
+                    int(epic_id),
+                    new_status,
                 )
             return result.endswith(" 1")
 
@@ -1358,10 +1388,16 @@ class Database:
                 VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, NOW(), $9, $10)
                 RETURNING id, started_at, completed_at
                 """,
-                int(move_id), repo, kind, verifier, status,
+                int(move_id),
+                repo,
+                kind,
+                verifier,
+                status,
                 json.dumps(evidence or {}),
                 json.dumps(kpi_delta or {}),
-                error, duration_ms, requested_by,
+                error,
+                duration_ms,
+                requested_by,
             )
             d = dict(row)
             for k in ("started_at", "completed_at"):
@@ -1382,11 +1418,17 @@ class Database:
         params: list[Any] = []
         i = 1
         if move_id is not None:
-            clauses.append(f"move_id = ${i}"); params.append(int(move_id)); i += 1
+            clauses.append(f"move_id = ${i}")
+            params.append(int(move_id))
+            i += 1
         if repo:
-            clauses.append(f"repo = ${i}"); params.append(repo); i += 1
+            clauses.append(f"repo = ${i}")
+            params.append(repo)
+            i += 1
         if status:
-            clauses.append(f"status = ${i}"); params.append(status); i += 1
+            clauses.append(f"status = ${i}")
+            params.append(status)
+            i += 1
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         sql = (
             "SELECT id, move_id, repo, kind, verifier, status, evidence,"
@@ -1454,7 +1496,11 @@ class Database:
                 RETURNING id, capability, repo, move_id, justification,
                           status, requested_by, requested_at
                 """,
-                capability, repo, move_id, justification, requested_by,
+                capability,
+                repo,
+                move_id,
+                justification,
+                requested_by,
             )
             d = dict(row)
             v = d.get("requested_at")
@@ -1477,7 +1523,8 @@ class Database:
                     WHERE status = $1
                     ORDER BY requested_at DESC LIMIT $2
                     """,
-                    status, int(limit),
+                    status,
+                    int(limit),
                 )
             else:
                 rows = await conn.fetch(
@@ -1504,7 +1551,7 @@ class Database:
         self,
         *,
         request_id: int,
-        decision: str,         # 'granted' | 'denied'
+        decision: str,  # 'granted' | 'denied'
         decided_by: str,
         grant_detail: str | None = None,
         deny_reason: str | None = None,
@@ -1519,8 +1566,11 @@ class Database:
                     grant_detail = $4, deny_reason = $5
                 WHERE id = $1 AND status = 'pending'
                 """,
-                int(request_id), decision, decided_by,
-                grant_detail, deny_reason,
+                int(request_id),
+                decision,
+                decided_by,
+                grant_detail,
+                deny_reason,
             )
             return result.endswith("UPDATE 1")
 
@@ -1551,7 +1601,9 @@ class Database:
                     RETURNING scope, score, sample_size,
                               last_passed_at, last_failed_at, updated_at
                     """,
-                    scope, new, passed,
+                    scope,
+                    new,
+                    passed,
                 )
             else:
                 # First sample — blend 0.5 prior with the observation.
@@ -1569,7 +1621,9 @@ class Database:
                     RETURNING scope, score, sample_size,
                               last_passed_at, last_failed_at, updated_at
                     """,
-                    scope, new, passed,
+                    scope,
+                    new,
+                    passed,
                 )
             d = dict(row)
             for k in ("last_passed_at", "last_failed_at", "updated_at"):
@@ -1578,9 +1632,7 @@ class Database:
                     d[k] = v.isoformat()
             return d
 
-    async def get_trust_scores(
-        self, *, scope: str | None = None
-    ) -> list[dict[str, Any]]:
+    async def get_trust_scores(self, *, scope: str | None = None) -> list[dict[str, Any]]:
         async with self.pool.acquire() as conn:
             if scope:
                 rows = await conn.fetch(

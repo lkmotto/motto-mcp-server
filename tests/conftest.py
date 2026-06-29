@@ -85,7 +85,8 @@ async def insert_agent(db, name: str, kind: str = "variable") -> int:
             ON CONFLICT (name) DO UPDATE SET last_seen_at = now()
             RETURNING id
             """,
-            name, kind,
+            name,
+            kind,
         )
 
 
@@ -108,13 +109,20 @@ async def insert_run(
             """,
             agent_name,
             UUID(parent_run_id) if parent_run_id else None,
-            kind, intent, status,
+            kind,
+            intent,
+            status,
         )
         return str(rid)
 
 
 async def insert_event(
-    db, *, agent_name: str, run_id: str, kind: str = "ev", level: str = "info",
+    db,
+    *,
+    agent_name: str,
+    run_id: str,
+    kind: str = "ev",
+    level: str = "info",
     payload: dict[str, Any] | None = None,
 ) -> int:
     await insert_agent(db, agent_name)
@@ -125,13 +133,22 @@ async def insert_event(
             SELECT id, $2, $3, $4, $5 FROM fleet.agents WHERE name = $1
             RETURNING id
             """,
-            agent_name, UUID(run_id), kind, level, payload or {},
+            agent_name,
+            UUID(run_id),
+            kind,
+            level,
+            payload or {},
         )
 
 
 async def insert_decision(
-    db, *, agent_name: str, run_id: str | None, choice: str,
-    rationale: str | None = None, payload: dict[str, Any] | None = None,
+    db,
+    *,
+    agent_name: str,
+    run_id: str | None,
+    choice: str,
+    rationale: str | None = None,
+    payload: dict[str, Any] | None = None,
 ) -> int:
     await insert_agent(db, agent_name)
     async with db.pool.acquire() as conn:
@@ -143,12 +160,19 @@ async def insert_decision(
             """,
             agent_name,
             UUID(run_id) if run_id else None,
-            choice, rationale, payload or {},
+            choice,
+            rationale,
+            payload or {},
         )
 
 
 async def insert_artifact(
-    db, *, agent_name: str, run_id: str, kind: str, name: str | None = None,
+    db,
+    *,
+    agent_name: str,
+    run_id: str,
+    kind: str,
+    name: str | None = None,
     content: dict[str, Any] | None = None,
 ) -> int:
     await insert_agent(db, agent_name)
@@ -159,12 +183,19 @@ async def insert_artifact(
             SELECT id, $2, $3, $4, $5 FROM fleet.agents WHERE name = $1
             RETURNING id
             """,
-            agent_name, UUID(run_id), kind, name, content or {},
+            agent_name,
+            UUID(run_id),
+            kind,
+            name,
+            content or {},
         )
 
 
 async def insert_lock(
-    db, *, resource: str, holder_run: str | None,
+    db,
+    *,
+    resource: str,
+    holder_run: str | None,
     expires_in_seconds: int = 600,
 ) -> None:
     async with db.pool.acquire() as conn:

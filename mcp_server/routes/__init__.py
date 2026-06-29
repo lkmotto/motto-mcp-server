@@ -37,12 +37,8 @@ def register_routes(mcp, db: Database) -> None:
         if not cockpit_auth_ok(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         agents = await db.fleet_status()
-        events = await db.recent_events(
-            since_minutes=60, agent_name=None, kind=None, limit=50
-        )
-        runs = await db.list_runs(
-            agent_name=None, status=None, since_minutes=60 * 24, limit=10
-        )
+        events = await db.recent_events(since_minutes=60, agent_name=None, kind=None, limit=50)
+        runs = await db.list_runs(agent_name=None, status=None, since_minutes=60 * 24, limit=10)
         return JSONResponse(
             {
                 "now": datetime.now(UTC).isoformat(),
@@ -99,6 +95,7 @@ def register_routes(mcp, db: Database) -> None:
         # Pull verify_move out of server.py at runtime to avoid an import
         # cycle (server imports routes, not the other way around).
         from .. import server as _server
+
         verify_move_fn = _server.verify_move
 
         tools = chat_tools.TOOL_SCHEMAS if tools_enabled else None
@@ -152,11 +149,13 @@ def register_routes(mcp, db: Database) -> None:
             # Dispatch each tool call and append a `tool` role result.
             for tc in tool_calls:
                 tc_id = tc.get("id")
-                fn = (tc.get("function") or {})
+                fn = tc.get("function") or {}
                 name = fn.get("name") or ""
                 raw_args = fn.get("arguments") or "{}"
                 try:
-                    args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args or {})
+                    args = (
+                        json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args or {})
+                    )
                 except json.JSONDecodeError:
                     args = {}
                 result = await chat_tools.dispatch(
@@ -190,8 +189,7 @@ def register_routes(mcp, db: Database) -> None:
             # Hit MAX_TOOL_HOPS — force a final summarization round
             # without tools to make sure the user gets text back.
             resp = await call_deepseek(
-                system=system
-                + "\n\n[note: tool budget exhausted, summarize what you did]",
+                system=system + "\n\n[note: tool budget exhausted, summarize what you did]",
                 messages=clean,
                 max_tokens=max_tokens,
                 tools=None,
@@ -275,9 +273,7 @@ def register_routes(mcp, db: Database) -> None:
         kind = body.get("kind")
         payload = body.get("payload") or {}
         if not kind or not isinstance(payload, dict):
-            return JSONResponse(
-                {"error": "kind + payload (object) required"}, status_code=400
-            )
+            return JSONResponse({"error": "kind + payload (object) required"}, status_code=400)
         try:
             row = await db.queue_local_task(
                 kind=str(kind),
@@ -450,9 +446,7 @@ def register_routes(mcp, db: Database) -> None:
         kind = body.get("kind")
         payload = body.get("payload") or {}
         if not target_agent or not kind:
-            return JSONResponse(
-                {"error": "target_agent and kind required"}, status_code=400
-            )
+            return JSONResponse({"error": "target_agent and kind required"}, status_code=400)
         if not isinstance(payload, dict):
             return JSONResponse({"error": "payload must be object"}, status_code=400)
 
@@ -474,10 +468,9 @@ def register_routes(mcp, db: Database) -> None:
     # before motto-director auto-acts. Same auth as everything else.
 
     def _approver_id(request: Request) -> str:
-        token = (
-            request.query_params.get("token")
-            or request.headers.get("authorization", "").removeprefix("Bearer ")
-        )
+        token = request.query_params.get("token") or request.headers.get(
+            "authorization", ""
+        ).removeprefix("Bearer ")
         # Don't echo the full token — a stable short fingerprint is enough.
         return f"cockpit:{token[:8]}" if token else "cockpit:anon"
 
@@ -492,7 +485,8 @@ def register_routes(mcp, db: Database) -> None:
             limit = 100
         try:
             moves = await db.director_pending_moves(
-                status=str(status), limit=min(limit, 500),
+                status=str(status),
+                limit=min(limit, 500),
             )
             counts = await db.director_pending_counts()
         except Exception as e:
@@ -515,15 +509,15 @@ def register_routes(mcp, db: Database) -> None:
             if isinstance(ids, list) and ids:
                 int_ids = [int(i) for i in ids]
                 n = await db.director_bulk_approve(
-                    move_ids=int_ids, approved_by=approved_by,
+                    move_ids=int_ids,
+                    approved_by=approved_by,
                 )
                 return JSONResponse({"approved": int(n)})
             if move_id is None:
-                return JSONResponse(
-                    {"error": "move_id or move_ids required"}, status_code=400
-                )
+                return JSONResponse({"error": "move_id or move_ids required"}, status_code=400)
             ok = await db.director_approve_move(
-                move_id=int(move_id), approved_by=approved_by,
+                move_id=int(move_id),
+                approved_by=approved_by,
             )
             return JSONResponse({"approved": 1 if ok else 0})
         except Exception as e:
@@ -544,7 +538,8 @@ def register_routes(mcp, db: Database) -> None:
         approved_by = _approver_id(request)
         try:
             ok = await db.director_reject_move(
-                move_id=int(move_id), approved_by=approved_by,
+                move_id=int(move_id),
+                approved_by=approved_by,
             )
         except Exception as e:
             logger.exception("director_reject failed")

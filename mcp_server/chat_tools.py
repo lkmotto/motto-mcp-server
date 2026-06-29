@@ -139,9 +139,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "get_fleet_status",
-            "description": (
-                "Snapshot of registered agents (last_seen, last_run, open intents)."
-            ),
+            "description": ("Snapshot of registered agents (last_seen, last_run, open intents)."),
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -381,9 +379,7 @@ def _chat_run_id(chat_user: str) -> str:
     return f"chat-{chat_user}-{int(time.time())}"
 
 
-async def _propose_verify_move(
-    db: Any, args: dict[str, Any], chat_user: str
-) -> dict[str, Any]:
+async def _propose_verify_move(db: Any, args: dict[str, Any], chat_user: str) -> dict[str, Any]:
     target = args.get("target_move_id")
     rationale = (args.get("rationale") or "").strip()
     if not target or not rationale:
@@ -421,9 +417,7 @@ async def _propose_verify_move(
     }
 
 
-async def _propose_file_issue(
-    db: Any, args: dict[str, Any], chat_user: str
-) -> dict[str, Any]:
+async def _propose_file_issue(db: Any, args: dict[str, Any], chat_user: str) -> dict[str, Any]:
     repo = (args.get("repo") or "").strip()
     title = (args.get("title") or "").strip()
     body = (args.get("body") or "").strip()
@@ -450,9 +444,7 @@ async def _propose_file_issue(
     }
 
 
-async def _propose_noop(
-    db: Any, args: dict[str, Any], chat_user: str
-) -> dict[str, Any]:
+async def _propose_noop(db: Any, args: dict[str, Any], chat_user: str) -> dict[str, Any]:
     rationale = (args.get("rationale") or "").strip()
     if not rationale:
         return {"error": "rationale is required"}
@@ -475,9 +467,7 @@ async def _propose_noop(
     }
 
 
-async def _request_capability(
-    db: Any, args: dict[str, Any], chat_user: str
-) -> dict[str, Any]:
+async def _request_capability(db: Any, args: dict[str, Any], chat_user: str) -> dict[str, Any]:
     capability = (args.get("capability") or "").strip()
     justification = (args.get("justification") or "").strip()
     if not capability or not justification:

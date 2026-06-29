@@ -8,6 +8,7 @@ Env vars consumed:
   PIPELINE_BASE_URL   — override (default: http://appraisal-pipeline:8080)
   COCKPIT_BASE_URL    — override (default: http://appraisal-cockpit:3001)
 """
+
 from __future__ import annotations
 
 import os
@@ -17,7 +18,7 @@ import httpx
 
 # ── internal base URLs (Northflank private DNS) ──────────────────────────────
 _PIPELINE_BASE = os.environ.get("PIPELINE_BASE_URL", "http://appraisal-pipeline:8080")
-_COCKPIT_BASE  = os.environ.get("COCKPIT_BASE_URL",  "http://appraisal-cockpit:3001")
+_COCKPIT_BASE = os.environ.get("COCKPIT_BASE_URL", "http://appraisal-cockpit:3001")
 _PIPELINE_SECRET = os.environ.get("PIPELINE_SECRET", "")
 
 _TIMEOUT = httpx.Timeout(60.0, connect=5.0)
@@ -31,6 +32,7 @@ def _pipeline_headers() -> dict[str, str]:
 
 
 # ── appraisal-pipeline tools ─────────────────────────────────────────────────
+
 
 async def pipeline_status() -> dict[str, Any]:
     """Return the JSON status of the last appraisal pipeline run."""
@@ -145,6 +147,7 @@ async def pipeline_sharpen_status() -> dict[str, Any]:
 
 # ── appraisal-cockpit tools ───────────────────────────────────────────────────
 
+
 async def cockpit_state() -> dict[str, Any]:
     """Return the live cockpit state JSON: queue, pending decisions, recent runs."""
     async with httpx.AsyncClient(timeout=_TIMEOUT) as c:
@@ -153,7 +156,9 @@ async def cockpit_state() -> dict[str, Any]:
         return r.json()
 
 
-async def cockpit_submit_intent(intent: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+async def cockpit_submit_intent(
+    intent: str, payload: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Post a manual intent / nudge to the cockpit (director signal).
 
     intent: short string like 'approve_comp', 'reject_value', 'escalate'.
@@ -167,6 +172,7 @@ async def cockpit_submit_intent(intent: str, payload: dict[str, Any] | None = No
 
 
 # ── registration helper ───────────────────────────────────────────────────────
+
 
 def register_proxy_tools(mcp: Any) -> None:
     """Register all fleet proxy tools onto a FastMCP instance."""

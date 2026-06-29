@@ -12,9 +12,7 @@ pytestmark = [requires_db, pytest.mark.asyncio]
 async def test_get_locks_returns_active_excludes_expired(db, server):
     rid = await insert_run(db, agent_name="agent-a")
     await insert_lock(db, resource="director:cycle", holder_run=rid)
-    await insert_lock(
-        db, resource="stale:resource", holder_run=rid, expires_in_seconds=-60
-    )
+    await insert_lock(db, resource="stale:resource", holder_run=rid, expires_in_seconds=-60)
 
     out = await _call(server, "get_locks")
     resources = {lock["resource"] for lock in out}

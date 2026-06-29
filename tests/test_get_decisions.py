@@ -35,9 +35,7 @@ async def test_get_decisions_filters_by_run_agent_choice(db, server):
     assert len(by_choice) == 3
 
     # Combined: run + choice.
-    combined = await _call(
-        server, "get_decisions", run_id=r1, choice="merge"
-    )
+    combined = await _call(server, "get_decisions", run_id=r1, choice="merge")
     assert len(combined) == 1
     assert combined[0]["choice"] == "merge"
     assert combined[0]["run_id"] == r1

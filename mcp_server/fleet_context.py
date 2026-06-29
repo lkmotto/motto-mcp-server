@@ -15,12 +15,8 @@ async def _build_fleet_context(db: Database) -> str:
     """Snapshot of live fleet state, injected into the director's system prompt."""
     try:
         agents = await db.fleet_status()
-        events = await db.recent_events(
-            since_minutes=60, agent_name=None, kind=None, limit=30
-        )
-        runs = await db.list_runs(
-            agent_name=None, status=None, since_minutes=60 * 24, limit=10
-        )
+        events = await db.recent_events(since_minutes=60, agent_name=None, kind=None, limit=30)
+        runs = await db.list_runs(agent_name=None, status=None, since_minutes=60 * 24, limit=10)
     except Exception as exc:  # pragma: no cover
         logger.exception("fleet context build failed")
         return f"[fleet state unavailable: {exc}]"
@@ -48,7 +44,5 @@ async def _build_fleet_context(db: Database) -> str:
         payload = json.dumps(e.get("payload") or {}, default=str)
         if len(payload) > 200:
             payload = payload[:197] + "\u2026"
-        parts.append(
-            f"- {e.get('ts')} {e.get('agent_name')} {e.get('kind')} {payload}\n"
-        )
+        parts.append(f"- {e.get('ts')} {e.get('agent_name')} {e.get('kind')} {payload}\n")
     return "".join(parts)

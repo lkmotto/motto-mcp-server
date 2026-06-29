@@ -21,7 +21,5 @@ async def test_force_release_removes_active_lock(db, server):
 
 
 async def test_force_release_unknown_resource_is_idempotent(db, server):
-    result = await _call(
-        server, "force_release_lock", resource="nonexistent:resource"
-    )
+    result = await _call(server, "force_release_lock", resource="nonexistent:resource")
     assert result == {"released": False}

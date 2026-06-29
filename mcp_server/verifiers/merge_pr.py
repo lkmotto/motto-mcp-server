@@ -39,6 +39,7 @@ def _extract_repo_pr(move: dict[str, Any]) -> tuple[str | None, int | None, str 
     if isinstance(payload, str):
         try:
             import json
+
             payload = json.loads(payload)
         except (ValueError, TypeError):
             payload = {}
@@ -123,7 +124,9 @@ async def verify(move: dict[str, Any], ctx: VerifyContext) -> VerifyResult:
 
     statuses = [(r.get("name"), r.get("status"), r.get("conclusion")) for r in runs]
     pending = [s for s in statuses if s[1] != "completed"]
-    failed = [s for s in statuses if s[1] == "completed" and s[2] not in ("success", "skipped", "neutral")]
+    failed = [
+        s for s in statuses if s[1] == "completed" and s[2] not in ("success", "skipped", "neutral")
+    ]
 
     if pending:
         return VerifyResult(

@@ -24,7 +24,7 @@ class VerifyResult:
 
 @dataclass
 class VerifyContext:
-    db: Any                               # mcp_server.db.Database
+    db: Any  # mcp_server.db.Database
     http_get: Callable[..., Awaitable[Any]]
     http_post: Callable[..., Awaitable[Any]]
     request_capability: Callable[[str, str, str | None], Awaitable[int]]

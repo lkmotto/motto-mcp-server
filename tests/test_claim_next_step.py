@@ -56,7 +56,12 @@ async def _insert_move(
             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
             RETURNING id
             """,
-            repo, kind, title, rationale, intent, priority,
+            repo,
+            kind,
+            title,
+            rationale,
+            intent,
+            priority,
             json.dumps(move_payload or {"task": "x"}),
             status,
         )
@@ -110,8 +115,11 @@ async def test_claim_next_step_respects_kinds_filter(pending_db, server):
     await _insert_move(pending_db, kind="merge_pr", title="mp")
 
     result = await _call(
-        server, "claim_next_step",
-        runner_id="droid-1", kinds=["factory_droid"], limit=5,
+        server,
+        "claim_next_step",
+        runner_id="droid-1",
+        kinds=["factory_droid"],
+        limit=5,
     )
     assert result["count"] == 1
     assert result["claimed"][0]["kind"] == "factory_droid"
@@ -146,8 +154,11 @@ async def test_release_claimed_step_returns_to_approved(pending_db, server):
     assert claimed["claimed"][0]["id"] == move_id
 
     released = await _call(
-        server, "release_claimed_step",
-        move_id=move_id, runner_id="droid-1", reason="ci-down",
+        server,
+        "release_claimed_step",
+        move_id=move_id,
+        runner_id="droid-1",
+        reason="ci-down",
     )
     assert released == {"ok": True, "released": True}
 
@@ -166,12 +177,18 @@ async def test_release_claimed_step_idempotent(pending_db, server):
     move_id = await _insert_move(pending_db, title="y")
     await _call(server, "claim_next_step", runner_id="droid-1", limit=1)
     first = await _call(
-        server, "release_claimed_step",
-        move_id=move_id, runner_id="droid-1", reason="",
+        server,
+        "release_claimed_step",
+        move_id=move_id,
+        runner_id="droid-1",
+        reason="",
     )
     second = await _call(
-        server, "release_claimed_step",
-        move_id=move_id, runner_id="droid-1", reason="",
+        server,
+        "release_claimed_step",
+        move_id=move_id,
+        runner_id="droid-1",
+        reason="",
     )
     assert first == {"ok": True, "released": True}
     assert second == {"ok": True, "released": False}

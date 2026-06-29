@@ -85,7 +85,6 @@ mcp = FastMCP(
         "and post cross-agent intents. motto-director consumes via "
         "get_fleet_status / get_recent_events."
     ),
-
     lifespan=_lifespan,
 )
 
@@ -103,9 +102,7 @@ async def register_agent(
     """Idempotent agent registration. `kind` is 'variable' or 'deterministic'."""
     if kind not in ("variable", "deterministic"):
         raise ValueError("kind must be 'variable' or 'deterministic'")
-    row = await db.upsert_agent(
-        name=name, kind=kind, deploy_target=deploy_target, version=version
-    )
+    row = await db.upsert_agent(name=name, kind=kind, deploy_target=deploy_target, version=version)
     return {"agent_id": row["id"], "name": row["name"]}
 
 
@@ -146,6 +143,7 @@ async def record_run_end(
         raise ValueError("status must be success / error / cancelled")
     try:
         from uuid import UUID as _UUID
+
         _UUID(run_id)
     except (ValueError, AttributeError) as exc:
         raise ValueError(
@@ -401,9 +399,7 @@ async def complete_local_task(
     error: str | None = None,
 ) -> dict[str, bool]:
     """Mark a local task succeeded/failed/cancelled with its result."""
-    ok = await db.complete_local_task(
-        task_id=task_id, status=status, result=result, error=error
-    )
+    ok = await db.complete_local_task(task_id=task_id, status=status, result=result, error=error)
     return {"ok": ok}
 
 
@@ -461,6 +457,7 @@ async def verify_move(
 
     started = time.time()
     async with httpx.AsyncClient(timeout=20.0) as client:
+
         async def _http_get(url: str, **kw: Any) -> Any:
             return await client.get(url, **kw)
 
@@ -571,9 +568,7 @@ async def list_verifications(
 ) -> list[dict[str, Any]]:
     """List recent move verifications, newest first. Filter by move_id,
     repo, or status (passed/failed/inconclusive/error)."""
-    return await db.list_verifications(
-        move_id=move_id, repo=repo, status=status, limit=limit
-    )
+    return await db.list_verifications(move_id=move_id, repo=repo, status=status, limit=limit)
 
 
 @mcp.tool
@@ -664,14 +659,14 @@ async def fleet_status_json(request: Request):
     if not _auth_ok(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     agents = await db.fleet_status()
-    events = await db.recent_events(
-        since_minutes=60, agent_name=None, kind=None, limit=200
+    events = await db.recent_events(since_minutes=60, agent_name=None, kind=None, limit=200)
+    return JSONResponse(
+        {
+            "now": datetime.now(UTC).isoformat(),
+            "agents": agents,
+            "recent_events": events,
+        }
     )
-    return JSONResponse({
-        "now": datetime.now(UTC).isoformat(),
-        "agents": agents,
-        "recent_events": events,
-    })
 
 
 @mcp.custom_route("/dashboard", methods=["GET"])
@@ -684,9 +679,7 @@ async def dashboard(request: Request):
             status_code=401,
         )
     agents = await db.fleet_status()
-    events = await db.recent_events(
-        since_minutes=60, agent_name=None, kind=None, limit=100
-    )
+    events = await db.recent_events(since_minutes=60, agent_name=None, kind=None, limit=100)
     return HTMLResponse(_render_dashboard(agents, events))
 
 
@@ -717,6 +710,7 @@ def _render_dashboard(agents: list[dict[str, Any]], events: list[dict[str, Any]]
     names and event payloads come from caller-controlled MCP tool input, so
     don't trust them.
     """
+
     def _kind(k: str) -> str:
         color = "#0a7" if k == "variable" else "#666"
         weight = "600" if k == "variable" else "400"
@@ -824,6 +818,7 @@ def main() -> None:
     # Mount domain servers when requested (e.g. all-in-one cluster deployment).
     if os.environ.get("MOTTO_MCP_MOUNT_DOMAIN_SERVERS") == "1":
         from servers.grabber.server import mcp as grabber_mcp  # noqa: PLC0415
+
         mcp.mount(grabber_mcp, namespace="grabber")
 
     port = int(os.environ.get("PORT", "8000"))

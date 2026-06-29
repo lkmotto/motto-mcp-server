@@ -3,6 +3,7 @@ Startup script: reads cloudflared log for latest tunnel URL
 and updates Cloudflare KV namespace so the Worker proxy stays current.
 Run this after cloudflared starts (service dependency or scheduled task).
 """
+
 import re
 import sys
 import time
@@ -15,9 +16,11 @@ LOG_PATH = r"C:\Users\lkmot\ona-mcp-server\tunnel-service-err.log"
 MAX_RETRIES = 30
 KV_PROPAGATION_WAIT_SECONDS = 8
 
+
 def extract_tunnel_url(log_content):
     match = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", log_content)
     return match.group(0) if match else None
+
 
 def get_tunnel_url_from_metrics(ports=(20241, 20242, 20243)):
     """Read live tunnel URL from cloudflared metrics endpoint."""
@@ -26,12 +29,16 @@ def get_tunnel_url_from_metrics(ports=(20241, 20242, 20243)):
             req = urllib.request.Request(f"http://127.0.0.1:{port}/metrics")
             resp = urllib.request.urlopen(req, timeout=2)
             body = resp.read().decode()
-            match = re.search(r'cloudflared_tunnel_user_hostnames_counts\{userHostname="(https://[^"]+trycloudflare\.com)"\}', body)
+            match = re.search(
+                r'cloudflared_tunnel_user_hostnames_counts\{userHostname="(https://[^"]+trycloudflare\.com)"\}',
+                body,
+            )
             if match:
                 return match.group(1)
         except Exception:
             continue
     return None
+
 
 def update_kv(url):
     body = url.encode()
@@ -39,10 +46,11 @@ def update_kv(url):
         f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/storage/kv/namespaces/{NAMESPACE_ID}/values/tunnel-url",
         data=body,
         headers={"Authorization": f"Bearer {TOKEN}"},
-        method="PUT"
+        method="PUT",
     )
     resp = urllib.request.urlopen(req)
     return resp.getcode() == 200
+
 
 def main():
     # Prefer live metrics endpoint (reflects currently running tunnel)
@@ -80,6 +88,7 @@ def main():
         time.sleep(2)
     print("Failed to update tunnel URL after max retries")
     sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

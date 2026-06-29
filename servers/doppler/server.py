@@ -84,9 +84,7 @@ class DopplerClient:
         except ValueError:
             data = {"raw": resp.text}
         if resp.status_code >= 400:
-            raise RuntimeError(
-                f"Doppler {method} {path} failed [{resp.status_code}]: {data}"
-            )
+            raise RuntimeError(f"Doppler {method} {path} failed [{resp.status_code}]: {data}")
         return data
 
     # ---- projects / configs ------------------------------------------------
@@ -134,9 +132,7 @@ class DopplerClient:
                     v.pop("computed", None)
         return secrets
 
-    async def get_secret(
-        self, project: str, config: str, name: str
-    ) -> dict[str, Any]:
+    async def get_secret(self, project: str, config: str, name: str) -> dict[str, Any]:
         data = await self._request(
             "GET",
             "/configs/config/secret",
@@ -144,9 +140,7 @@ class DopplerClient:
         )
         return data.get("secret", {})
 
-    async def set_secret(
-        self, project: str, config: str, name: str, value: str
-    ) -> dict[str, Any]:
+    async def set_secret(self, project: str, config: str, name: str, value: str) -> dict[str, Any]:
         data = await self._request(
             "POST",
             "/configs/config/secrets",
@@ -158,9 +152,7 @@ class DopplerClient:
         )
         return data
 
-    async def delete_secret(
-        self, project: str, config: str, name: str
-    ) -> dict[str, Any]:
+    async def delete_secret(self, project: str, config: str, name: str) -> dict[str, Any]:
         # Doppler deletes by setting null
         data = await self._request(
             "POST",
@@ -256,9 +248,7 @@ def build_server(client: DopplerClient | None = None) -> FastMCP:
         """List secret keys for a project/config. Set include_values=True to also
         return raw values (avoid this in chat — values can leak into transcripts).
         """
-        secrets = await _client().list_secrets(
-            project, config, include_values=include_values
-        )
+        secrets = await _client().list_secrets(project, config, include_values=include_values)
         return {
             "project": project,
             "config": config,
@@ -287,9 +277,7 @@ def build_server(client: DopplerClient | None = None) -> FastMCP:
                 "would_write_to": f"{payload.project}/{payload.config}",
                 "secret_name": payload.name,
             }
-        await _client().set_secret(
-            payload.project, payload.config, payload.name, payload.value
-        )
+        await _client().set_secret(payload.project, payload.config, payload.name, payload.value)
         return {
             "ok": True,
             "project": payload.project,
@@ -419,9 +407,7 @@ def build_server(client: DopplerClient | None = None) -> FastMCP:
             elif projects_with == [CANONICAL_PROJECT]:
                 canonical_only.append(name)
             else:
-                non_canonical_only.append(
-                    {"name": name, "project": projects_with[0]}
-                )
+                non_canonical_only.append({"name": name, "project": projects_with[0]})
 
         return {
             "canonical_project": CANONICAL_PROJECT,

@@ -42,8 +42,8 @@ DIRECTOR_PERSONA = (
     "when Luke explicitly says to.\n\n"
     "## How to operate\n\n"
     "1. When asked about state, call the read tool first. Don't speculate.\n"
-    "2. When Luke gives a directive (\"verify move 97\", \"track this as an "
-    "issue\", \"we need a github token\"), pick the right tool and call it. "
+    '2. When Luke gives a directive ("verify move 97", "track this as an '
+    'issue", "we need a github token"), pick the right tool and call it. '
     "Echo the resulting queued_move_id or request_id back so he can act on "
     "it.\n"
     "3. After a tool call returns, summarize what happened in one or two "
@@ -63,12 +63,8 @@ DIRECTOR_PERSONA = (
 
 # ── DeepSeek API config ───────────────────────────────────────────────────────
 
-DEEPSEEK_BASE_URL = os.environ.get(
-    "DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"
-)
-DEEPSEEK_DEFAULT_MODEL = os.environ.get(
-    "DEEPSEEK_MODEL", "deepseek-v4-flash"
-)
+DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+DEEPSEEK_DEFAULT_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
 DEEPSEEK_TIMEOUT_S = float(os.environ.get("DEEPSEEK_TIMEOUT_S", "120"))
 
 
@@ -116,9 +112,7 @@ async def call_deepseek(
     # OpenAI-compatible chat completions: prepend system as a role-message
     # rather than relying on a separate system parameter (DeepSeek accepts
     # both but role-message is more portable).
-    payload_messages: list[dict[str, Any]] = [
-        {"role": "system", "content": system}
-    ]
+    payload_messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
     for m in messages:
         role = m.get("role", "user")
         if role == "system":

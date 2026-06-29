@@ -49,9 +49,7 @@ async def _pool() -> asyncpg.Pool:
                 "and inject at runtime. Without it the grabber MCP server cannot "
                 "read or write rotation jobs."
             )
-        _pool_holder["p"] = await asyncpg.create_pool(
-            url, min_size=1, max_size=5, init=_init_conn
-        )
+        _pool_holder["p"] = await asyncpg.create_pool(url, min_size=1, max_size=5, init=_init_conn)
     return _pool_holder["p"]
 
 

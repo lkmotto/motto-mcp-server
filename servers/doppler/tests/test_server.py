@@ -78,16 +78,12 @@ class FakeClient(DopplerClient):
             return {}
         return {"name": name, "raw": v, "computed": v}
 
-    async def set_secret(
-        self, project: str, config: str, name: str, value: str
-    ) -> dict[str, Any]:
+    async def set_secret(self, project: str, config: str, name: str, value: str) -> dict[str, Any]:
         self.store.setdefault((project, config), {})[name] = value
         self.actions.append({"action": "set", "project": project, "name": name})
         return {"ok": True}
 
-    async def delete_secret(
-        self, project: str, config: str, name: str
-    ) -> dict[str, Any]:
+    async def delete_secret(self, project: str, config: str, name: str) -> dict[str, Any]:
         self.store.get((project, config), {}).pop(name, None)
         self.actions.append({"action": "delete", "project": project, "name": name})
         return {"ok": True}

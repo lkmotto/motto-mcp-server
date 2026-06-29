@@ -271,8 +271,12 @@ async def test_get_rotation_includes_decision_link(server):
     job_id = uuid.uuid4()
     started = _now()
     ended = datetime(
-        started.year, started.month, started.day,
-        started.hour, started.minute, started.second + 5,
+        started.year,
+        started.month,
+        started.day,
+        started.hour,
+        started.minute,
+        started.second + 5,
         tzinfo=UTC,
     )
     row = _job_row(
@@ -339,8 +343,8 @@ async def test_grabber_health_summary_shape(server, monkeypatch):
     # We use a stateful fake that returns responses in sequence.
     call_index = [0]
     results = [
-        {"n": 3},   # queued
-        {"n": 1},   # running
+        {"n": 3},  # queued
+        {"n": 1},  # running
         {"status": "succeeded", "ended_at": ended_at},  # last job
     ]
 
@@ -391,13 +395,13 @@ async def test_no_secret_in_any_response(server):
     tainted_row = {
         "id": job_id,
         "service": "anthropic",
-        "reason": SENTINEL,       # reason is a user-controlled field
+        "reason": SENTINEL,  # reason is a user-controlled field
         "requested_by": SENTINEL,  # also user-controlled
         "status": "succeeded",
         "created_at": _now(),
         "started_at": _now(),
         "ended_at": _now(),
-        "error_class": None,       # must be None — class name only, no message
+        "error_class": None,  # must be None — class name only, no message
         "audit_decision_id": decision_id,
     }
 
@@ -451,6 +455,6 @@ async def test_no_secret_in_any_response(server):
     # Confirm no stray column named 'payload', 'evidence', 'secret', 'credential'
     # appears anywhere in the serialised output.
     for forbidden in ("payload", "evidence", "secret", "credential"):
-        assert forbidden not in out_json.lower() or out.get(forbidden) is None, (
-            f"Forbidden key '{forbidden}' found in get_rotation response"
-        )
+        assert (
+            forbidden not in out_json.lower() or out.get(forbidden) is None
+        ), f"Forbidden key '{forbidden}' found in get_rotation response"

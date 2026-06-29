@@ -17,18 +17,24 @@ pytestmark = [requires_db, pytest.mark.asyncio]
 
 
 async def test_get_run_returns_run_events_decisions_artifacts(db, server):
-    rid = await insert_run(
-        db, agent_name="agent-a", kind="cycle", intent="do the thing"
-    )
+    rid = await insert_run(db, agent_name="agent-a", kind="cycle", intent="do the thing")
     await insert_event(db, agent_name="agent-a", run_id=rid, kind="started")
     await insert_event(db, agent_name="agent-a", run_id=rid, kind="finished")
     await insert_decision(
-        db, agent_name="agent-a", run_id=rid, choice="merge",
-        rationale="ci green", payload={"pr": 42},
+        db,
+        agent_name="agent-a",
+        run_id=rid,
+        choice="merge",
+        rationale="ci green",
+        payload={"pr": 42},
     )
     await insert_artifact(
-        db, agent_name="agent-a", run_id=rid, kind="prompt",
-        name="ideate", content={"text": "hi"},
+        db,
+        agent_name="agent-a",
+        run_id=rid,
+        kind="prompt",
+        name="ideate",
+        content={"text": "hi"},
     )
 
     out = await _call(server, "get_run", run_id=rid)

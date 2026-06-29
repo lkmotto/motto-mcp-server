@@ -17,17 +17,11 @@ pytestmark = [requires_db, pytest.mark.asyncio]
 
 async def test_replay_run_includes_parent_and_children(db, server):
     parent_id = await insert_run(db, agent_name="agent-a", kind="parent")
-    child_id_1 = await insert_run(
-        db, agent_name="agent-a", kind="child-1", parent_run_id=parent_id
-    )
-    child_id_2 = await insert_run(
-        db, agent_name="agent-a", kind="child-2", parent_run_id=parent_id
-    )
+    child_id_1 = await insert_run(db, agent_name="agent-a", kind="child-1", parent_run_id=parent_id)
+    child_id_2 = await insert_run(db, agent_name="agent-a", kind="child-2", parent_run_id=parent_id)
 
     await insert_event(db, agent_name="agent-a", run_id=parent_id, kind="ev")
-    await insert_decision(
-        db, agent_name="agent-a", run_id=parent_id, choice="dispatch"
-    )
+    await insert_decision(db, agent_name="agent-a", run_id=parent_id, choice="dispatch")
 
     out = await _call(server, "replay_run", run_id=parent_id)
 
@@ -41,9 +35,7 @@ async def test_replay_run_includes_parent_and_children(db, server):
 
 async def test_replay_child_run_links_back_to_parent(db, server):
     parent_id = await insert_run(db, agent_name="agent-a", kind="parent")
-    child_id = await insert_run(
-        db, agent_name="agent-a", kind="child", parent_run_id=parent_id
-    )
+    child_id = await insert_run(db, agent_name="agent-a", kind="child", parent_run_id=parent_id)
 
     out = await _call(server, "replay_run", run_id=child_id)
     assert out["run"]["id"] == child_id

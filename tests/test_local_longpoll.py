@@ -97,9 +97,7 @@ async def test_longpoll_claim_logic_no_tasks():
 
     tasks: list[Any] = []
     while True:
-        result = await mock_db.claim_local_tasks(
-            runner_id="test-runner", kinds=None, limit=5
-        )
+        result = await mock_db.claim_local_tasks(runner_id="test-runner", kinds=None, limit=5)
         if result:
             tasks = result
             break
@@ -124,9 +122,7 @@ async def test_longpoll_claim_logic_task_available_on_second_tick():
 
     tasks: list[Any] = []
     while True:
-        result = await mock_db.claim_local_tasks(
-            runner_id="test-runner", kinds=None, limit=5
-        )
+        result = await mock_db.claim_local_tasks(runner_id="test-runner", kinds=None, limit=5)
         if result:
             tasks = result
             break
