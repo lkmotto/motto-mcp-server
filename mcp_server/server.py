@@ -35,6 +35,7 @@ from typing import Any
 
 from fastmcp.server import FastMCP
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+from motto_common.sentry_init import init_sentry
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
@@ -814,6 +815,11 @@ _register_cockpit_routes(mcp, db)
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+
+    # Wire Sentry error tracking with release version (git SHA auto-detected
+    # by motto_common.sentry_init._git_sha). No-ops gracefully when SENTRY_DSN
+    # is unset (dev / CI).
+    init_sentry(agent_name="motto-mcp-server")
 
     # Mount domain servers when requested (e.g. all-in-one cluster deployment).
     if os.environ.get("MOTTO_MCP_MOUNT_DOMAIN_SERVERS") == "1":
