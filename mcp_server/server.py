@@ -28,11 +28,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from html import escape as h
 from typing import Any
 
+import httpx
 from fastmcp.server import FastMCP
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from motto_common.sentry_init import init_sentry
@@ -41,6 +43,8 @@ from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from .db import Database
 from .routes import register_routes as _register_cockpit_routes
+from .verifiers import VerifyContext
+from .verifiers import dispatch as _dispatch_verifier
 
 logger = logging.getLogger(__name__)
 
@@ -432,14 +436,6 @@ async def list_local_tasks(
 # request and a human approves it.
 
 
-import time
-
-import httpx
-
-from .verifiers import VerifyContext
-from .verifiers import dispatch as _dispatch_verifier
-
-
 @mcp.tool
 async def verify_move(
     move_id: int,
@@ -747,7 +743,8 @@ def _render_dashboard(agents: list[dict[str, Any]], events: list[dict[str, Any]]
                 f"<td>{_kind(a['kind'])}</td>"
                 f"<td>{h(a.get('deploy_target') or '—')}</td>"
                 f"<td>{h(a.get('version') or '—')}</td>"
-                f"<td title=\"{h(a.get('last_seen_at') or '')}\">{h(_fmt_age(a.get('last_seen_at')))}</td>"
+                f"<td title=\"{h(a.get('last_seen_at') or '')}\">"
+                f"{h(_fmt_age(a.get('last_seen_at')))}</td>"
                 f"<td>{h(((a.get('last_run') or {}) or {}).get('kind') or '—')}</td>"
                 f"<td>{_status(((a.get('last_run') or {}) or {}).get('status') or '—')}</td>"
                 f"<td>{a.get('open_intents', 0)}</td>"

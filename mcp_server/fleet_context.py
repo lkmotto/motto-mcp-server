@@ -37,7 +37,8 @@ async def _build_fleet_context(db: Database) -> str:
     for r in runs:
         parts.append(
             f"- {r.get('agent_name')} {r.get('kind')} {r.get('status')} "
-            f"started={r.get('started_at')} summary={json.dumps(r.get('summary') or {}, default=str)[:200]}\n"
+            f"started={r.get('started_at')} "
+            f"summary={json.dumps(r.get('summary') or {}, default=str)[:200]}\n"
         )
     parts.append("\n## Recent events (last 60min, max 30)\n")
     for e in events:

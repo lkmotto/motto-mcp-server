@@ -129,7 +129,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "properties": {
                     "scope": {
                         "type": "string",
-                        "description": "Filter to one scope (e.g. 'global' or 'lkmotto/motto-director').",
+                        "description": (
+                            "Filter to one scope"
+                            " (e.g. 'global' or 'lkmotto/motto-director')."
+                        ),
                     },
                 },
             },

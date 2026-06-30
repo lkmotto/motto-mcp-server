@@ -19,7 +19,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from json import JSONDecodeError, dumps, loads
+from json import dumps, loads
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -137,7 +137,10 @@ def _api(
                 continue
             if 500 <= status < 600:
                 wait = 2**attempt
-                print(f"  Server error ({status}). Retrying in {wait}s (attempt {attempt}/{max_retries})...")
+                print(
+                    f"  Server error ({status})."
+                    f" Retrying in {wait}s (attempt {attempt}/{max_retries})..."
+                )
                 time.sleep(wait)
                 continue
             # 4xx (except 429): no retry
@@ -149,7 +152,10 @@ def _api(
             return status, None
         except (urllib.error.URLError, OSError) as exc:
             wait = 2**attempt
-            print(f"  Connection error: {exc}. Retrying in {wait}s (attempt {attempt}/{max_retries})...")
+            print(
+                f"  Connection error: {exc}."
+                f" Retrying in {wait}s (attempt {attempt}/{max_retries})..."
+            )
             time.sleep(wait)
             continue
     print(f"  Max retries ({max_retries}) exhausted.")
@@ -186,7 +192,8 @@ def main() -> int:
     print()
 
     existing = _existing_rule_names()
-    print(f"Existing rules ({len(existing)}): {', '.join(sorted(existing)) if existing else 'none'}")
+    rules_list = ", ".join(sorted(existing)) if existing else "none"
+    print(f"Existing rules ({len(existing)}): {rules_list}")
 
     created = 0
     skipped = 0
