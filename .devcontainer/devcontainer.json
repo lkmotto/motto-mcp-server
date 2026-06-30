@@ -1,0 +1,16 @@
+{
+  "name": "motto-mcp-server",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "features": {
+    "ghcr.io/devcontainers/features/python:1": {}
+  },
+  "postCreateCommand": "pip install uv && uv sync",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "charliermarsh.ruff",
+        "ms-python.mypy-type-checker"
+      ]
+    }
+  }
+}
